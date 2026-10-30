@@ -1,0 +1,63 @@
+R version 4.4.0 (2024-04-24)
+Platform: aarch64-apple-darwin20
+Running under: macOS 26.2
+
+Matrix products: default
+BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
+LAPACK: /Library/Frameworks/R.framework/Versions/4.4-arm64/Resources/lib/libRlapack.dylib;  LAPACK version 3.12.0
+
+locale:
+[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+time zone: Europe/Istanbul
+tzcode source: internal
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+[1] scales_1.4.0      ggrepel_0.9.8     ggplot2_4.0.0     tibble_3.3.0      dplyr_1.1.4      
+[6] rrobot_0.2.0      robustbase_0.99-6 fMRIscrub_0.14.5 
+
+loaded via a namespace (and not attached):
+ [1] gtable_0.3.6                   shape_1.4.6.1                 
+ [3] lattice_0.22-6                 quadprog_1.5-8                
+ [5] gamlss_5.5-0                   vctrs_0.6.5                   
+ [7] tools_4.4.0                    generics_0.1.4                
+ [9] stats4_4.4.0                   curl_7.0.0                    
+[11] parallel_4.4.0                 proxy_0.4-27                  
+[13] DEoptimR_1.1-4                 xts_0.14.1                    
+[15] pkgconfig_2.0.3                Matrix_1.7-0                  
+[17] CerioliOutlierDetection_1.1.15 RColorBrewer_1.1-3            
+[19] S7_0.2.0                       imputeTS_3.4                  
+[21] lifecycle_1.0.4                compiler_4.4.0                
+[23] farver_2.1.2                   stringr_1.5.2                 
+[25] textshaping_0.4.0              stinepack_1.5                 
+[27] RhpcBLASctl_0.23-42            class_7.3-22                  
+[29] cellWise_2.5.4                 tidyr_1.3.1                   
+[31] pillar_1.11.1                  rrcov_1.7-7                   
+[33] MASS_7.3-60.2                  nlme_3.1-164                  
+[35] fracdiff_1.5-3                 svd_0.5.8                     
+[37] tidyselect_1.2.1               mvtnorm_1.3-3                 
+[39] stringi_1.8.7                  purrr_1.1.0                   
+[41] reshape2_1.4.4                 labeling_0.4.3                
+[43] tseries_0.10-58                splines_4.4.0                 
+[45] pcaPP_2.0-5                    gamlss.dist_6.1-1             
+[47] grid_4.4.0                     gamlss.data_6.0-7             
+[49] colorspace_2.1-2               expm_1.0-0                    
+[51] cli_3.6.5                      magrittr_2.0.4                
+[53] survival_3.5-8                 e1071_1.7-16                  
+[55] withr_3.0.2                    forecast_8.24.0               
+[57] TTR_0.24.4                     fMRItools_0.6.0               
+[59] matrixStats_1.5.0              quantmod_0.4.28               
+[61] ggtext_0.1.2                   nnet_7.3-19                   
+[63] timeDate_4051.111              gridExtra_2.3                 
+[65] ragg_1.3.2                     zoo_1.8-14                    
+[67] pesel_0.7.5                    isotree_0.6.1-4               
+[69] urca_1.3-4                     lmtest_0.9-40                 
+[71] fastICA_1.2-4                  rlang_1.1.6                   
+[73] gridtext_0.1.5                 Rcpp_1.1.0                    
+[75] glue_1.8.0                     xml2_1.4.1                    
+[77] jsonlite_2.0.0                 rstudioapi_0.16.0             
+[79] R6_2.6.1                       plyr_1.8.9                    
+[81] systemfonts_1.1.0             
