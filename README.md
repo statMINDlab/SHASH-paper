@@ -21,6 +21,9 @@ in the SHASH manuscript.
 
 - `sessionInfo.txt`: R session information from the original analysis.
 
+- `figures/figure13_source_images/`: Individual MANGO images and legends
+  used to assemble Figure 13 in Adobe Illustrator.
+
 ## Main analysis
 
 The script uses `fMRIscrub::Dat1` and `fMRIscrub::Dat2` as inputs.
