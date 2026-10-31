@@ -1,0 +1,143 @@
+---
+title: "1.1 Simulation data"
+author: "Saranjeet Singh Saluja"
+output: html_notebook
+---
+
+Generates the contaminated datasets for simulation study 2 (manuscript Figures 6, 7 and S.4–S.9).
+Output: `simulation_data.parquet`, which is read by `1.1.2_Simulation_Fitting.Rmd`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(purrr)
+library(vsgoftest)
+library(gamlss)
+library(arrow)
+library(rrobot)   
+```
+
+## Settings
+
+The paper uses `nsim = 1000` with all distributions and contamination levels.
+This file shows how the data were generated; rerunning it will not reproduce the exact `simulation_data.parquet` used in the paper, which is provided and read by the later files.
+For a smaller run, lower `nsim` or shorten `distributions` / `percentages`.
+
+```{r}
+data_dir <- "data"
+
+nsim          <- 1000
+distributions <- c("df_T", "df_laplace", "df_normal", "df_gamma", "df_chisq", "df_weibull")
+percentages   <- c("1%", "5%", "10%", "20%", "30%")
+
+n          <- 500
+perc_out   <- c(0.01, 0.05, 0.1, 0.2, 0.3)
+n_out      <- round(n * perc_out)
+thresholds <- seq(0.5, 0.6, by = 0.05)   # iForest score thresholds
+```
+
+## Distributions
+
+```{r}
+draw_data <- function(n) {
+  list(
+    df_T       = rt(n, df = 4),
+    df_laplace = vsgoftest::rlaplace(n, mu = 0, b = 3),
+    df_normal  = rnorm(n, mean = 10, sd = 3),
+    df_gamma   = rgamma(n, shape = 2, scale = 1),
+    df_chisq   = rchisq(n, df = 3),
+    df_weibull = rweibull(n, shape = 1, scale = 3)
+  )
+}
+```
+
+## SHASH parameters of each distribution
+
+Fitted once to 100,000 draws (Table 3). Used to place the outliers on the original scale.
+
+```{r}
+set.seed(123)
+
+n_shash   <- 100000
+fit_order <- c("df_normal", "df_T", "df_laplace", "df_gamma", "df_chisq", "df_weibull")
+
+big_draws <- map(fit_order, function(d) {
+  switch(d,
+         df_normal  = rnorm(n_shash, 10, 3),
+         df_T       = rt(n_shash, df = 4),
+         df_laplace = vsgoftest::rlaplace(n_shash, mu = 0, b = 3),
+         df_gamma   = rgamma(n_shash, shape = 2, scale = 1),
+         df_chisq   = rchisq(n_shash, df = 3),
+         df_weibull = rweibull(n_shash, shape = 1, scale = 3))
+})
+
+param_df <- map2_dfr(fit_order, big_draws, function(d, x) {
+  fit <- gamlssML(x ~ 1, family = "SHASHo2", maxit = 10000)
+  est <- coefAll(fit)
+  tibble(dist = d, mu = est$mu, sigma = est$sigma, nu = est$nu, tau = est$tau)
+})
+param_df
+```
+
+## Contamination
+
+Outlier magnitudes are chi-square(4)/5 + 3 on the z-scale, given a random sign for the symmetric distributions, and mapped back to the original scale with the SHASH parameters above.
+For the normal distribution the z-scale is just (x - 10)/3.
+
+```{r}
+generate_sim <- function(sim) {
+  dat <- draw_data(n)
+
+  map_dfr(names(dat), function(dist_name) {
+    x <- dat[[dist_name]]
+    est <- param_df %>% filter(dist == dist_name)
+
+    map_dfr(seq_along(n_out), function(j) {
+      idx      <- sample(seq(n), n_out[j])
+      out_vals <- rchisq(n_out[j], df = 4) / 5 + 3
+
+      if (dist_name %in% c("df_T", "df_laplace", "df_normal")) {
+        out_vals <- sample(c(-1, 1), n_out[j], replace = TRUE) * out_vals
+      }
+
+      x_out <- x
+      if (dist_name == "df_normal") {
+        z <- (x - 10) / 3
+        z[idx] <- out_vals
+        x_out <- 10 + 3 * z
+      } else {
+        x_out[idx] <- rrobot::normal_to_SHASH(out_vals, mu = est$mu, sigma = est$sigma,
+                                              nu = est$nu, tau = est$tau)
+      }
+
+      map_dfr(thresholds, function(thr) {
+        tibble(
+          simulation             = sim,
+          distribution           = dist_name,
+          threshold              = thr,
+          percentage             = paste0(perc_out[j] * 100, "%"),
+          original_values        = list(x),
+          outlier_infused_values = list(x_out),
+          true_outliers          = list(seq(n) %in% idx)
+        )
+      })
+    })
+  })
+}
+```
+
+## Run and save
+
+```{r}
+set.seed(42)
+
+df_results <- map_dfr(seq_len(nsim), generate_sim) %>%
+  filter(distribution %in% distributions, percentage %in% percentages) %>%
+  mutate(percentage = factor(percentage, levels = c("1%", "5%", "10%", "20%", "30%")))
+
+write_parquet(df_results, file.path(data_dir, "rawdata_simulations.parquet"))
+df_results
+```
