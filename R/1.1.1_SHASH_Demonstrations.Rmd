@@ -21,9 +21,9 @@ library(ggthemes)
 library(vsgoftest)
 library(cowplot)
 library(ggpubr)
-library(rrobot)   # remotes::install_github("mandymejia/rrobot")
+library(rrobot) 
 
-plot_dir <- "plots"
+plot_dir <- "../plots"
 
 save_plot <- function(p, filename, subdir, width = 2, height = 2, ...) {
   path <- file.path(plot_dir, subdir)
@@ -83,7 +83,7 @@ param_tbl <- tibble(
   sigma = 1,
   nu    = c(0, 0, 0, -2, 2),
   tau   = c(10, 0.5, 1, 1, 1),
-  dist  = c("light-tailed", "heavy-tailed", "normal", "left-skewed", "right-skewed")
+  dist  = c("heavy-tailed", "light-tailed", "normal", "left-skewed", "right-skewed")
 )
 
 df_dist_shapes <- param_tbl %>%
