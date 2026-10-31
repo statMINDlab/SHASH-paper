@@ -1,0 +1,441 @@
+---
+title: "1.3 New simulation comparison"
+author: "Saranjeet Singh Saluja"
+output: html_notebook
+---
+
+Comparisons added in response to the reviewers: SHASH-i and SHASH-z against iForest+ used alone, and against SHASH-50 (SHASH with the most extreme 50% of observations flagged at initialization).
+Reuses the simulated datasets from `rawdata_simulations.parquet`.
+
+- Response Figure 1 (also Figure S.10): iForest+ alone vs SHASH-z and SHASH-i
+- Response Figure 2: SHASH-50 vs SHASH-z and SHASH-i, all fits and degenerate fits removed
+- Response Figure 3: degenerate fit rates including SHASH-50
+- Figure S.13: degenerate fit rates for SHASH-z and SHASH-i
+- Degenerate fit counts and their effect on TPR and FPR quoted in the response
+
+All fits use thr0 = 2.58, thr1 = 3, thr = 3 and iForest threshold 0.6.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(arrow)
+library(ggplot2)
+library(rrobot)
+
+plot_dir <- "plots"
+data_dir <- "data"
+```
+
+## Settings
+
+`run_fits = FALSE` reads the provided fitted results, which are the ones used in the paper.
+`run_fits = TRUE` refits from `rawdata_simulations.parquet` and overwrites them; for a smaller run, shorten `n_sims`, `distributions` or `percentages`.
+
+```{r}
+run_fits <- FALSE
+
+n_sims        <- 1000
+distributions <- c("df_normal", "df_T", "df_laplace", "df_gamma", "df_chisq", "df_weibull")
+percentages   <- c("1%", "5%", "10%", "20%", "30%")
+
+thr_iso  <- 0.6
+iso_seed <- 1
+
+results_file <- file.path(data_dir, "simulation_results_new_1000_thr1_3.parquet")
+diag_file    <- file.path(data_dir, "simulation_diagnostics_new_thr1_3.parquet")
+
+pct_levels  <- c("1%", "5%", "10%", "20%", "30%")
+dist_levels <- c("Normal", "T", "Laplace", "Gamma", "Chi-Square", "Weibull")
+dist_recode <- c(df_normal = "Normal", df_T = "T", df_laplace = "Laplace",
+                 df_gamma = "Gamma", df_chisq = "Chi-Square", df_weibull = "Weibull")
+
+tail_type <- function(dist_name) {
+  if (dist_name %in% c("df_T", "df_laplace", "df_normal")) "both" else "upper"
+}
+```
+
+## Fitting
+
+SHASH fit that records warnings, errors, convergence and degeneracy instead of stopping.
+
+```{r, eval = run_fits}
+classify_warning <- function(msg) {
+  if (is.na(msg)) return("none")
+  if (grepl("singular", msg, ignore.case = TRUE)) return("singular")
+  if (grepl("convergence problem|iteration limit", msg, ignore.case = TRUE)) return("convergence")
+  if (grepl("OpenMP|thread", msg, ignore.case = TRUE)) return("openmp_notice")
+  "other"
+}
+
+stopifnot("max_abs_z" %in% names(formals(rrobot::SHASH_out)))   # needs the rrobot degeneracy check
+
+fit_shash_capture <- function(x, tail, method_init) {
+  msgs      <- character(0)
+  degen_msg <- NA_character_
+
+  result <- withCallingHandlers(
+    tryCatch({
+      res <- rrobot::SHASH_out(x, thr0 = 2.58, thr1 = 3, thr = 3, tail = tail,
+                               method_init = method_init, thr_iso = thr_iso,
+                               iso_seed = iso_seed, maxit = 100)
+      list(res = res, error = NA_character_)
+    }, error = function(e) list(res = NULL, error = e$message)),
+    # the degeneracy warning is stored on its own, not with the other warnings
+    SHASH_degenerate_fit = function(w) {
+      degen_msg <<- conditionMessage(w)
+      invokeRestart("muffleWarning")
+    },
+    warning = function(w) {
+      msgs[[length(msgs) + 1]] <<- conditionMessage(w)
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  all_msgs <- c(result$error, msgs)
+  all_msgs <- all_msgs[!is.na(all_msgs)]
+  res      <- result$res
+
+  list(
+    res            = res,
+    out_idx        = if (!is.null(res)) res$out_idx else NULL,
+    converged      = if (!is.null(res)) isTRUE(res$converged) else NA,
+    last_iter      = if (!is.null(res)) res$last_iter else NA_integer_,
+    degenerate     = if (!is.null(res)) isTRUE(res$degenerate) else NA,
+    max_abs_z      = if (!is.null(res)) as.numeric(res$max_abs_z) else NA_real_,
+    n_extreme      = if (!is.null(res)) as.integer(res$n_extreme) else NA_integer_,
+    degen_msg      = degen_msg,
+    fit_failed     = is.null(res),
+    optim_singular = any(grepl("singular convergence", all_msgs, ignore.case = TRUE)),
+    singular       = any(grepl("singular", all_msgs, ignore.case = TRUE)),
+    warned         = length(all_msgs) > 0,
+    error          = if (length(all_msgs) > 0) paste(all_msgs, collapse = " | ") else NA_character_
+  )
+}
+```
+
+Runs iForest+, SHASH-i, SHASH-z and SHASH-50 on one dataset. Returns the per-observation flags; the per-fit diagnostics, including each method's final thresholds, go to `DIAG_STORE`.
+
+```{r, eval = run_fits}
+run_methods_new <- function(.x, .y) {
+  x    <- unlist(.x$outlier_infused_values)
+  n    <- length(x)
+  tail <- tail_type(as.character(.y$distribution))
+
+  num1 <- function(v) if (is.null(v) || length(v) != 1) NA_real_ else as.numeric(v)
+
+  # iForest+ alone: the initialization flags, with no SHASH fit
+  iforest_msg <- NA_character_
+  init_res    <- NULL
+  flagged_iforest <- tryCatch({
+    init_res <- outlier_init(x, method = "isoplus", thr_iso = thr_iso, tail = tail, seed = iso_seed)
+    !init_res$weight_new
+  }, error = function(e) {
+    iforest_msg <<- e$message
+    rep(NA, n)
+  })
+
+  fi  <- fit_shash_capture(x, tail, "isoplus")
+  fz  <- fit_shash_capture(x, tail, "emprule")
+  f50 <- fit_shash_capture(x, tail, "fifty")
+
+  to_flags <- function(f) if (!is.null(f$out_idx)) seq_len(n) %in% f$out_idx else rep(NA, n)
+  thr_up   <- function(f) if (is.null(f$res)) NA_real_ else num1(f$res$final_thr_upper)
+  thr_lo   <- function(f) if (is.null(f$res)) NA_real_ else num1(f$res$final_thr_lower)
+
+  diagnostics <- tibble(
+    method         = c("iForest+", "SHASH-i", "SHASH-z", "SHASH-50"),
+    singular_error = c(NA,          fi$singular,       fz$singular,       f50$singular),
+    optim_singular = c(NA,          fi$optim_singular, fz$optim_singular, f50$optim_singular),
+    fit_failed     = c(!is.na(iforest_msg), fi$fit_failed, fz$fit_failed, f50$fit_failed),
+    degenerate     = c(NA,          fi$degenerate,     fz$degenerate,     f50$degenerate),
+    max_abs_z      = c(NA_real_,    fi$max_abs_z,      fz$max_abs_z,      f50$max_abs_z),
+    n_extreme      = c(NA_integer_, fi$n_extreme,      fz$n_extreme,      f50$n_extreme),
+    degen_msg      = c(NA_character_, fi$degen_msg,    fz$degen_msg,      f50$degen_msg),
+    warned         = c(!is.na(iforest_msg), fi$warned, fz$warned,         f50$warned),
+    error_msg      = c(iforest_msg, fi$error,          fz$error,          f50$error),
+    iter_converged = c(NA,          fi$converged,      fz$converged,      f50$converged),
+    last_iter      = c(NA_integer_, fi$last_iter,      fz$last_iter,      f50$last_iter),
+    thr_upper      = c(num1(init_res$cutoff_upper), thr_up(fi), thr_up(fz), thr_up(f50)),
+    thr_lower      = c(num1(init_res$cutoff_lower), thr_lo(fi), thr_lo(fz), thr_lo(f50))
+  ) %>%
+    mutate(simulation   = .y$simulation,
+           distribution = .y$distribution,
+           threshold    = .y$threshold,
+           percentage   = .y$percentage)
+
+  key <- paste(.y$simulation, .y$distribution, .y$threshold, .y$percentage, sep = "|")
+  DIAG_STORE[[key]] <<- diagnostics
+
+  .x %>%
+    mutate(flagged_iforest  = flagged_iforest,
+           flagged_shash_i  = to_flags(fi),
+           flagged_shash_z  = to_flags(fz),
+           flagged_shash_50 = to_flags(f50))
+}
+```
+
+```{r, eval = run_fits}
+df_sim <- read_parquet(file.path(data_dir, "rawdata_simulations.parquet")) %>%
+  mutate(percentage = factor(percentage, levels = pct_levels)) %>%
+  filter(threshold == thr_iso,
+         simulation   <= n_sims,
+         distribution %in% distributions,
+         percentage   %in% percentages)
+
+DIAG_STORE <- new.env(parent = emptyenv())
+
+df_new <- df_sim %>%
+  group_by(simulation, distribution, threshold, percentage) %>%
+  group_modify(run_methods_new) %>%
+  ungroup()
+
+df_diag <- bind_rows(as.list(DIAG_STORE)) %>%
+  mutate(warning_class = sapply(error_msg, classify_warning))
+
+write_parquet(df_new,  results_file)
+write_parquet(df_diag, diag_file)
+```
+
+## Results
+
+```{r}
+df_new  <- read_parquet(results_file)
+df_diag <- read_parquet(diag_file)
+
+cat("flag rows:", nrow(df_new), " diagnostic rows:", nrow(df_diag),
+    " simulations:", n_distinct(df_new$simulation), "\n")
+```
+
+## Degenerate fits
+
+More than 1% of transformed values beyond |z| = 20. iForest+ has no SHASH fit.
+Response: 2,907 of 24,000 SHASH-50 fits (12.1%), 310 SHASH-i (1.3%) and 166 SHASH-z (0.7%), contamination 1–20%.
+
+```{r}
+degen_13 <- df_diag %>%
+  filter(method != "iForest+") %>%
+  mutate(distribution = factor(recode(distribution, !!!dist_recode), levels = dist_levels),
+         degen = degenerate %in% TRUE)
+
+degen_13 %>%
+  filter(percentage != "30%") %>%
+  group_by(method) %>%
+  summarise(n_fits = n(), n_degen = sum(degen),
+            pct_degen = round(100 * mean(degen), 2), .groups = "drop")
+```
+
+SHASH-50 per distribution and contamination level (response: Weibull 48.7% and 97.5% at 10% and 20%, Chi-square 80.8% at 20%).
+
+```{r}
+degen_13 %>%
+  filter(method == "SHASH-50") %>%
+  group_by(distribution, percentage) %>%
+  summarise(cell = sprintf("%d (%.1f%%)", sum(degen), 100 * mean(degen)), .groups = "drop") %>%
+  pivot_wider(names_from = percentage, values_from = cell) %>%
+  print(width = Inf)
+```
+
+## TPR and FPR
+
+Contamination 1–20%. No fits excluded here; degenerate fits are removed in `perf_summary_nodegen`.
+
+```{r}
+df_metrics <- df_new %>%
+  filter(percentage != "30%") %>%
+  group_by(simulation, distribution, percentage, threshold) %>%
+  summarise(
+    TPR_iforest  = sum(flagged_iforest  &  true_outliers, na.rm = TRUE) / sum(true_outliers),
+    FPR_iforest  = sum(flagged_iforest  & !true_outliers, na.rm = TRUE) / sum(!true_outliers),
+    TPR_shash_i  = sum(flagged_shash_i  &  true_outliers, na.rm = TRUE) / sum(true_outliers),
+    FPR_shash_i  = sum(flagged_shash_i  & !true_outliers, na.rm = TRUE) / sum(!true_outliers),
+    TPR_shash_z  = sum(flagged_shash_z  &  true_outliers, na.rm = TRUE) / sum(true_outliers),
+    FPR_shash_z  = sum(flagged_shash_z  & !true_outliers, na.rm = TRUE) / sum(!true_outliers),
+    TPR_shash_50 = sum(flagged_shash_50 &  true_outliers, na.rm = TRUE) / sum(true_outliers),
+    FPR_shash_50 = sum(flagged_shash_50 & !true_outliers, na.rm = TRUE) / sum(!true_outliers),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(starts_with("TPR_"), starts_with("FPR_")),
+               names_to = c("metric", "method_raw"),
+               names_pattern = "^(TPR|FPR)_(.*)$",
+               values_to = "value") %>%
+  pivot_wider(names_from = metric, values_from = value) %>%
+  mutate(method = recode(method_raw, iforest = "iForest+", shash_i = "SHASH-i",
+                         shash_z = "SHASH-z", shash_50 = "SHASH-50")) %>%
+  dplyr::select(-method_raw) %>%
+  left_join(df_diag %>% dplyr::select(simulation, distribution, threshold, percentage,
+                                      method, degenerate),
+            by = c("simulation", "distribution", "threshold", "percentage", "method")) %>%
+  mutate(distribution = factor(recode(distribution, !!!dist_recode), levels = dist_levels))
+
+summarise_perf <- function(d) {
+  d %>%
+    group_by(distribution, percentage, threshold, method) %>%
+    summarise(n_valid  = n(),
+              mean_TPR = mean(TPR, na.rm = TRUE),
+              mean_FPR = mean(FPR, na.rm = TRUE),
+              .groups  = "drop")
+}
+
+perf_summary         <- summarise_perf(df_metrics)
+perf_summary_nodegen <- summarise_perf(df_metrics %>% filter(!(degenerate %in% TRUE)))
+
+# cells left with fewer fits after removal
+# (response: SHASH-50 keeps 25 Weibull and 192 Chi-square datasets of 1,000 at 20%)
+perf_summary_nodegen %>% filter(n_valid < 900) %>% arrange(n_valid) %>% print(width = Inf)
+```
+
+Effect of removing degenerate fits (response: SHASH-50 FPR for Weibull at 10% is about 0.087 with all fits and 0.007 without; SHASH-i and SHASH-z FPR for Weibull at 20% goes from about 0.02 to 0.008).
+
+```{r}
+dw <- function(d) {
+  d %>%
+    summarise(n_fits    = n(),
+              n_degen   = sum(degen),
+              pct_degen = round(100 * mean(degen), 1),
+              TPR_all   = mean(TPR, na.rm = TRUE),
+              TPR_kept  = mean(TPR[!degen], na.rm = TRUE),
+              FPR_all   = mean(FPR, na.rm = TRUE),
+              FPR_kept  = mean(FPR[!degen], na.rm = TRUE),
+              .groups = "drop") %>%
+    mutate(dTPR = round(TPR_kept - TPR_all, 4),
+           dFPR = round(FPR_kept - FPR_all, 5),
+           across(c(TPR_all, TPR_kept), ~ round(.x, 3)),
+           across(c(FPR_all, FPR_kept), ~ round(.x, 4)))
+}
+
+degen_cmp <- df_metrics %>%
+  filter(method != "iForest+") %>%
+  mutate(degen  = degenerate %in% TRUE,
+         method = factor(method, levels = c("SHASH-i", "SHASH-z", "SHASH-50")))
+
+degen_cmp %>% group_by(method) %>% dw() %>% print(width = Inf)
+
+degen_cmp %>%
+  group_by(method, distribution, percentage) %>%
+  dw() %>%
+  print(n = 72, width = Inf)
+```
+
+## Figures
+
+```{r}
+dist_colors <- c("Normal" = "#08306B", "T" = "#0072B2", "Laplace" = "#56B4E9",
+                 "Gamma" = "#D55E00", "Chi-Square" = "#E69F00", "Weibull" = "#CC79A7")
+dist_shapes <- c("Normal" = 16, "T" = 17, "Laplace" = 15,
+                 "Gamma" = 1, "Chi-Square" = 2, "Weibull" = 0)
+
+# nominal FPR: 0.003 two-sided (dashed), 0.00135 one-sided (dotted)
+ref_lines <- data.frame(
+  Metric = factor("FPR", levels = c("TPR", "FPR")),
+  yint   = c(0.003, 0.00135),
+  type   = factor(c("two-sided", "one-sided"), levels = c("two-sided", "one-sided"))
+)
+
+perf_theme <- theme_bw(base_size = 10) +
+  theme(legend.position  = "bottom",
+        axis.text.x      = element_text(size = 10, angle = 45, hjust = 1),
+        axis.text.y      = element_text(size = 10),
+        axis.title       = element_text(size = 11),
+        strip.text       = element_text(face = "bold", size = 10),
+        legend.text      = element_text(size = 10),
+        panel.grid.minor = element_blank())
+
+out_dir <- file.path(plot_dir, "thr3", "Performance")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+build_perf_plot_by_method <- function(methods_keep, fname, summary_df, width = 8, height = 5) {
+  d <- summary_df %>%
+    filter(method %in% methods_keep) %>%
+    pivot_longer(cols = c(mean_TPR, mean_FPR), names_to = "Metric",
+                 names_prefix = "mean_", values_to = "mean_value") %>%
+    mutate(method     = factor(method, levels = methods_keep),
+           percentage = factor(as.character(percentage), levels = c("1%", "5%", "10%", "20%")),
+           Metric     = factor(Metric, levels = c("TPR", "FPR")))
+
+  p <- ggplot(d, aes(x = percentage, y = mean_value,
+                     color = distribution, shape = distribution, group = distribution)) +
+    geom_hline(data = ref_lines, aes(yintercept = yint, linetype = type),
+               colour = "grey30", linewidth = 0.4, show.legend = FALSE) +
+    geom_line(linewidth = 0.6) +
+    geom_point(size = 2, stroke = 0.8) +
+    facet_grid(Metric ~ method, scales = "free_y") +
+    scale_color_manual(values = dist_colors, name = NULL) +
+    scale_shape_manual(values = dist_shapes, name = NULL) +
+    scale_linetype_manual(values = c("two-sided" = "dashed", "one-sided" = "dotted"), guide = "none") +
+    guides(color = guide_legend(nrow = 1), shape = guide_legend(nrow = 1)) +
+    labs(x = "Outlier Percentage", y = "Mean Value") +
+    perf_theme
+
+  print(p)
+  ggsave(filename = fname, plot = p, path = out_dir, width = width, height = height, dpi = 600)
+  invisible(p)
+}
+```
+
+Figure S.10 and Response Figure 1: degenerate SHASH fits removed.
+
+```{r, fig.width = 12, fig.height = 5}
+build_perf_plot_by_method(c("iForest+", "SHASH-z", "SHASH-i"),
+                          "FPR_TPR_iForest_vs_SHASH_byMethod_excl-degenerate.png",
+                          perf_summary_nodegen)
+```
+
+Response Figure 2: (a) all fits, (b) degenerate fits removed.
+
+```{r, fig.width = 12, fig.height = 5}
+build_perf_plot_by_method(c("SHASH-50", "SHASH-z", "SHASH-i"),
+                          "FPR_TPR_SHASH50_vs_SHASH_byMethod.png",
+                          perf_summary)
+
+build_perf_plot_by_method(c("SHASH-50", "SHASH-z", "SHASH-i"),
+                          "FPR_TPR_SHASH50_vs_SHASH_byMethod_excl-degenerate.png",
+                          perf_summary_nodegen)
+```
+
+Figure S.13 (SHASH-z and SHASH-i) and Response Figure 3 (with SHASH-50): percentage of degenerate fits, 1,000 datasets per cell.
+
+```{r, fig.width = 10, fig.height = 4}
+degen_rate <- degen_13 %>%
+  filter(percentage != "30%") %>%
+  mutate(percentage = droplevels(factor(percentage, levels = pct_levels))) %>%
+  group_by(method, distribution, percentage) %>%
+  summarise(n_fits = n(), n_degen = sum(degen), pct_degen = 100 * mean(degen), .groups = "drop")
+
+# values behind the plots (S.13 caption: Weibull 20%, 16% SHASH-z and 27% SHASH-i)
+degen_rate %>%
+  mutate(method = factor(method, levels = c("SHASH-50", "SHASH-z", "SHASH-i")),
+         cell   = sprintf("%.1f", pct_degen)) %>%
+  dplyr::select(method, distribution, percentage, cell) %>%
+  pivot_wider(names_from = percentage, values_from = cell) %>%
+  arrange(method, distribution) %>%
+  print(n = 30)
+
+build_degen_rate_plot <- function(methods_keep, fname, width) {
+  p <- degen_rate %>%
+    filter(method %in% methods_keep) %>%
+    mutate(method = factor(method, levels = methods_keep)) %>%
+    ggplot(aes(x = percentage, y = pct_degen, colour = distribution,
+               shape = distribution, group = distribution)) +
+    geom_line(linewidth = 0.6) +
+    geom_point(size = 2, stroke = 0.8) +
+    facet_grid(. ~ method) +
+    scale_y_continuous(limits = c(0, NA)) +
+    scale_colour_manual(values = dist_colors, name = NULL) +
+    scale_shape_manual(values = dist_shapes, name = NULL) +
+    guides(colour = guide_legend(nrow = 1), shape = guide_legend(nrow = 1)) +
+    labs(x = "Outlier Percentage", y = "Degenerate fits (%)") +
+    perf_theme
+
+  print(p)
+  ggsave(filename = fname, plot = p, path = out_dir, width = width, height = 4, dpi = 600)
+  invisible(p)
+}
+
+build_degen_rate_plot(c("SHASH-z", "SHASH-i"), "DegenerateRate_SHASHz_SHASHi.png", width = 7)
+build_degen_rate_plot(c("SHASH-50", "SHASH-z", "SHASH-i"), "DegenerateRate_byMethod.png", width = 10)
+```
