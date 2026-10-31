@@ -111,109 +111,109 @@ sim_seed_of <- function(scenario, n, percentage, sim) {
 The non-robust fit never calls `SHASH_out`, so rrobot's degeneracy rule (more than 1% of values beyond |z| = 20, or non-finite values) is applied to it here.
 
 ```{r, eval = run_sim}
-degen_screen <- function(z, max_abs_z = 20, min_frac = 0.01) {
-  if (is.null(z) || !length(z)) return(list(degenerate = NA, max_abs_z = NA_real_, n_extreme = NA_integer_))
-  finite <- is.finite(z)
-  mx <- if (any(finite)) max(abs(z[finite])) else Inf
-  if (!all(finite)) return(list(degenerate = TRUE, max_abs_z = mx, n_extreme = 0L))
-  n_ext <- sum(abs(z) > max_abs_z)
-  list(degenerate = n_ext > max(1L, ceiling(min_frac * length(z))), max_abs_z = mx, n_extreme = n_ext)
-}
-
-capture_msgs <- function(expr_fun) {
-  msgs <- character(0)
-  degen_msg <- NA_character_
-  out <- withCallingHandlers(
-    expr_fun(),
-    SHASH_degenerate_fit = function(w) {
-      degen_msg <<- conditionMessage(w)
-      invokeRestart("muffleWarning")
-    },
-    warning = function(w) {
-      msgs[[length(msgs) + 1]] <<- conditionMessage(w)
-      invokeRestart("muffleWarning")
-    }
-  )
-  all_msgs <- c(out$error, msgs)
-  all_msgs <- all_msgs[!is.na(all_msgs)]
-  c(out, list(degen_msg = degen_msg,
-              singular  = any(grepl("singular", all_msgs, ignore.case = TRUE)),
-              warned    = length(all_msgs) > 0,
-              msgs      = if (length(all_msgs)) paste(all_msgs, collapse = " | ") else NA_character_))
-}
-
-fit_nonrobust <- function(x) {
-  r <- capture_msgs(function() tryCatch({
-    e <- gamlss::coefAll(gamlss::gamlssML(x ~ 1, family = "SHASHo2", maxit = 1e4))
-    list(est = e, z = rrobot::SHASH_to_normal(x, mu = e$mu, sigma = e$sigma, nu = e$nu, tau = e$tau),
-         error = NA_character_)
-  }, error = function(e) list(est = NULL, z = NULL, error = e$message)))
-  c(r, degen_screen(r$z), list(out_idx = NULL, converged = NA, last_iter = NA_integer_))
-}
-
-# start.from is on the natural scale (gamlssML starting values)
-fit_robust <- function(x, tail, thr1 = 3, start.from = NULL) {
-  capture_msgs(function() tryCatch({
-    res <- rrobot::SHASH_out(x, thr0 = 2.58, thr1 = thr1, thr = 3, tail = tail,
-                             method_init = "isoplus", thr_iso = 0.6, start.from = start.from,
-                             maxit = 100, max_abs_z = 20, min_frac = 0.01)
-    list(est = res$SHASH_coef, out_idx = res$out_idx, z = res$x_norm,
-         degenerate = res$degenerate, max_abs_z = res$max_abs_z, n_extreme = res$n_extreme,
-         converged = isTRUE(res$converged), last_iter = res$last_iter, error = NA_character_)
-  }, error = function(e) list(est = NULL, out_idx = NULL, z = NULL, degenerate = NA,
-                              max_abs_z = NA_real_, n_extreme = NA_integer_,
-                              converged = NA, last_iter = NA_integer_, error = e$message)))
-}
-
-fit_row <- function(f, method, version, d, sim, sim_seed, scenario, n, p, params) {
-  k <- length(d$idx)
-  if (!is.null(f$out_idx)) {
-    tp <- length(intersect(f$out_idx, d$idx)); fp <- length(setdiff(f$out_idx, d$idx))
-    tpr <- if (k > 0) tp / k else NA_real_;    fpr <- fp / (n - k)
-  } else {
-    tp <- NA_integer_; fp <- NA_integer_; tpr <- NA_real_; fpr <- NA_real_
-  }
-  getp <- function(p) if (!is.null(f$est)) f$est[[p]] else NA_real_
-  tibble(
-    simulation = sim, sim_seed = sim_seed, scenario = scenario, n = n, percentage = p,
-    method = method, version = version,
-    true_mu = params$mu, true_sigma = params$sigma, true_nu = params$nu, true_tau = params$tau,
-    est_mu = getp("mu"), est_sigma = getp("sigma"), est_nu = getp("nu"), est_tau = getp("tau"),
-    singular_error = f$singular, warned = f$warned, error_msg = f$msgs,
-    degenerate = f$degenerate, max_abs_z = f$max_abs_z, n_extreme = f$n_extreme,
-    degen_msg = f$degen_msg, iter_converged = f$converged, last_iter = f$last_iter,
-    n_true_out = k, n_inlier = length(d$inl),
-    TP = tp, FP = fp, TPR = tpr, FPR = fpr,
-    w2_inlier = if (!is.null(f$z)) cvm_stat(f$z[d$inl]) else NA_real_,
-    w2_all    = if (!is.null(f$z)) cvm_stat(f$z) else NA_real_
-  )
-}
-
-version_spec <- list("V1: default"    = list(thr1 = 3,    true_start = FALSE),
-                     "V2: true start" = list(thr1 = 3,    true_start = TRUE),
-                     "V3: thr1=2.58"  = list(thr1 = 2.58, true_start = FALSE))
-
-design <- expand_grid(scenario = scenarios, n = sample_sizes, percentage = perc_out, sim = seq_len(nsim))
-
-results <- pmap_dfr(design, function(scenario, n, percentage, sim) {
-  params   <- paper_params %>% filter(scenario == !!scenario)
-  tail     <- tail_type_scenario(scenario)
-  sim_seed <- sim_seed_of(scenario, n, percentage, sim)
-  d        <- make_data(scenario, n, percentage, sim_seed)
-  true_start <- c(mu = params$mu, sigma = exp(params$sigma), nu = params$nu, tau = exp(params$tau))
-
-  rows <- list(fit_row(fit_nonrobust(d$x), "Non-robust MLE", "Non-robust",
-                       d, sim, sim_seed, scenario, n, percentage, params))
-  for (v in versions) {
-    s <- version_spec[[v]]
-    f <- fit_robust(d$x, tail, thr1 = s$thr1, start.from = if (s$true_start) true_start else NULL)
-    rows[[length(rows) + 1]] <- fit_row(f, "Robust (SHASH-i)", v, d, sim, sim_seed,
-                                        scenario, n, percentage, params)
-  }
-  bind_rows(rows)
-})
-
-write_parquet(results, results_file)   # sigma and tau on the log scale
+# degen_screen <- function(z, max_abs_z = 20, min_frac = 0.01) {
+#   if (is.null(z) || !length(z)) return(list(degenerate = NA, max_abs_z = NA_real_, n_extreme = NA_integer_))
+#   finite <- is.finite(z)
+#   mx <- if (any(finite)) max(abs(z[finite])) else Inf
+#   if (!all(finite)) return(list(degenerate = TRUE, max_abs_z = mx, n_extreme = 0L))
+#   n_ext <- sum(abs(z) > max_abs_z)
+#   list(degenerate = n_ext > max(1L, ceiling(min_frac * length(z))), max_abs_z = mx, n_extreme = n_ext)
+# }
+# 
+# capture_msgs <- function(expr_fun) {
+#   msgs <- character(0)
+#   degen_msg <- NA_character_
+#   out <- withCallingHandlers(
+#     expr_fun(),
+#     SHASH_degenerate_fit = function(w) {
+#       degen_msg <<- conditionMessage(w)
+#       invokeRestart("muffleWarning")
+#     },
+#     warning = function(w) {
+#       msgs[[length(msgs) + 1]] <<- conditionMessage(w)
+#       invokeRestart("muffleWarning")
+#     }
+#   )
+#   all_msgs <- c(out$error, msgs)
+#   all_msgs <- all_msgs[!is.na(all_msgs)]
+#   c(out, list(degen_msg = degen_msg,
+#               singular  = any(grepl("singular", all_msgs, ignore.case = TRUE)),
+#               warned    = length(all_msgs) > 0,
+#               msgs      = if (length(all_msgs)) paste(all_msgs, collapse = " | ") else NA_character_))
+# }
+# 
+# fit_nonrobust <- function(x) {
+#   r <- capture_msgs(function() tryCatch({
+#     e <- gamlss::coefAll(gamlss::gamlssML(x ~ 1, family = "SHASHo2", maxit = 1e4))
+#     list(est = e, z = rrobot::SHASH_to_normal(x, mu = e$mu, sigma = e$sigma, nu = e$nu, tau = e$tau),
+#          error = NA_character_)
+#   }, error = function(e) list(est = NULL, z = NULL, error = e$message)))
+#   c(r, degen_screen(r$z), list(out_idx = NULL, converged = NA, last_iter = NA_integer_))
+# }
+# 
+# # start.from is on the natural scale (gamlssML starting values)
+# fit_robust <- function(x, tail, thr1 = 3, start.from = NULL) {
+#   capture_msgs(function() tryCatch({
+#     res <- rrobot::SHASH_out(x, thr0 = 2.58, thr1 = thr1, thr = 3, tail = tail,
+#                              method_init = "isoplus", thr_iso = 0.6, start.from = start.from,
+#                              maxit = 100, max_abs_z = 20, min_frac = 0.01)
+#     list(est = res$SHASH_coef, out_idx = res$out_idx, z = res$x_norm,
+#          degenerate = res$degenerate, max_abs_z = res$max_abs_z, n_extreme = res$n_extreme,
+#          converged = isTRUE(res$converged), last_iter = res$last_iter, error = NA_character_)
+#   }, error = function(e) list(est = NULL, out_idx = NULL, z = NULL, degenerate = NA,
+#                               max_abs_z = NA_real_, n_extreme = NA_integer_,
+#                               converged = NA, last_iter = NA_integer_, error = e$message)))
+# }
+# 
+# fit_row <- function(f, method, version, d, sim, sim_seed, scenario, n, p, params) {
+#   k <- length(d$idx)
+#   if (!is.null(f$out_idx)) {
+#     tp <- length(intersect(f$out_idx, d$idx)); fp <- length(setdiff(f$out_idx, d$idx))
+#     tpr <- if (k > 0) tp / k else NA_real_;    fpr <- fp / (n - k)
+#   } else {
+#     tp <- NA_integer_; fp <- NA_integer_; tpr <- NA_real_; fpr <- NA_real_
+#   }
+#   getp <- function(p) if (!is.null(f$est)) f$est[[p]] else NA_real_
+#   tibble(
+#     simulation = sim, sim_seed = sim_seed, scenario = scenario, n = n, percentage = p,
+#     method = method, version = version,
+#     true_mu = params$mu, true_sigma = params$sigma, true_nu = params$nu, true_tau = params$tau,
+#     est_mu = getp("mu"), est_sigma = getp("sigma"), est_nu = getp("nu"), est_tau = getp("tau"),
+#     singular_error = f$singular, warned = f$warned, error_msg = f$msgs,
+#     degenerate = f$degenerate, max_abs_z = f$max_abs_z, n_extreme = f$n_extreme,
+#     degen_msg = f$degen_msg, iter_converged = f$converged, last_iter = f$last_iter,
+#     n_true_out = k, n_inlier = length(d$inl),
+#     TP = tp, FP = fp, TPR = tpr, FPR = fpr,
+#     w2_inlier = if (!is.null(f$z)) cvm_stat(f$z[d$inl]) else NA_real_,
+#     w2_all    = if (!is.null(f$z)) cvm_stat(f$z) else NA_real_
+#   )
+# }
+# 
+# version_spec <- list("V1: default"    = list(thr1 = 3,    true_start = FALSE),
+#                      "V2: true start" = list(thr1 = 3,    true_start = TRUE),
+#                      "V3: thr1=2.58"  = list(thr1 = 2.58, true_start = FALSE))
+# 
+# design <- expand_grid(scenario = scenarios, n = sample_sizes, percentage = perc_out, sim = seq_len(nsim))
+# 
+# results <- pmap_dfr(design, function(scenario, n, percentage, sim) {
+#   params   <- paper_params %>% filter(scenario == !!scenario)
+#   tail     <- tail_type_scenario(scenario)
+#   sim_seed <- sim_seed_of(scenario, n, percentage, sim)
+#   d        <- make_data(scenario, n, percentage, sim_seed)
+#   true_start <- c(mu = params$mu, sigma = exp(params$sigma), nu = params$nu, tau = exp(params$tau))
+# 
+#   rows <- list(fit_row(fit_nonrobust(d$x), "Non-robust MLE", "Non-robust",
+#                        d, sim, sim_seed, scenario, n, percentage, params))
+#   for (v in versions) {
+#     s <- version_spec[[v]]
+#     f <- fit_robust(d$x, tail, thr1 = s$thr1, start.from = if (s$true_start) true_start else NULL)
+#     rows[[length(rows) + 1]] <- fit_row(f, "Robust (SHASH-i)", v, d, sim, sim_seed,
+#                                         scenario, n, percentage, params)
+#   }
+#   bind_rows(rows)
+# })
+# 
+# write_parquet(results, results_file)   # sigma and tau on the log scale
 ```
 
 ## Results
@@ -423,11 +423,13 @@ cvm_col <- c("Non-robust MLE" = "#E69F00", "RewML Box-Cox/YJ" = "grey50", "SHASH
 cvm_agg <- bind_rows(
   results_kept %>%
     filter(version %in% names(ver_lab), n == n_cvm, percentage %in% perc_fig, !is.na(w2_inlier)) %>%
-    mutate(method_label = unname(ver_lab[version])) %>%
+    mutate(method_label = unname(ver_lab[version]),
+           scenario     = factor(scenario, levels = scen_keep)) %>%
     cvm_summary(),
   rew_w2 %>%
     filter(!is.na(w2_inlier)) %>%
-    mutate(method_label = "RewML Box-Cox/YJ") %>%
+    mutate(method_label = "RewML Box-Cox/YJ",
+           scenario     = factor(scenario, levels = scen_keep)) %>%
     cvm_summary()
 ) %>%
   mutate(method_label = factor(method_label, levels = names(cvm_col)),
