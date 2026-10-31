@@ -1,0 +1,436 @@
+---
+title: "02 Real data analysis"
+author: "Saranjeet Singh Saluja"
+output: html_notebook
+---
+
+Section 4: RewML Box-Cox/Yeo-Johnson, SHASH-z and SHASH-i applied to three benchmark datasets.
+
+- Figure 8: Top Gear (Weight, MPG, log(MPG), Price, log(Price))
+- Figure 9: HBK
+- Figure 10: Wood, first robust principal component
+- Figure S.14: Wood scatterplot matrix
+- Thresholds, flag counts and degenerate fits quoted in the text
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(tibble)
+library(purrr)
+library(ggplot2)
+library(cowplot)
+library(robustbase)
+library(robustHD)
+library(rrcov)
+library(cellWise)
+library(rrobot)
+
+plot_dir <- "plots"
+toy_dir  <- file.path(plot_dir, "thr3", "ToyDatasets")
+for (d in c("TopGear", "HBK", "Wood")) dir.create(file.path(toy_dir, d), recursive = TRUE, showWarnings = FALSE)
+
+data("TopGear", package = "robustHD")
+data("hbk",     package = "robustbase")
+data("wood",    package = "robustbase")
+```
+
+## Methods
+
+```{r}
+run_all_methods <- function(x, tail = "upper", thr_iso = 0.6, yj_type = "bestObj") {
+  shash <- function(method_init) {
+    rrobot::SHASH_out(x, thr0 = 2.58, thr1 = 3, thr = 3, tail = tail,
+                      method_init = method_init, thr_iso = thr_iso, maxit = 100)
+  }
+  list(YJ      = cellWise::transfo(x, type = yj_type, robust = TRUE, standardize = TRUE),
+       SHASH.i = shash("isoplus"),
+       SHASH.z = shash("emprule"))
+}
+
+flag_by_tail <- function(z, tail, thr = 3) {
+  if (tail == "upper") which(z > thr) else if (tail == "lower") which(z < -thr) else which(abs(z) > thr)
+}
+
+# outlier thresholds on the original scale; sigma and tau are on the log scale
+shash_cutoff <- function(fit, q) {
+  cf <- fit$SHASH_coef
+  as.numeric(rrobot::normal_to_SHASH(q, cf$mu, cf$sigma, cf$nu, cf$tau))
+}
+yj_cutoff <- function(yj, q) {
+  tryCatch(as.numeric(cellWise::transfo_transformback(q, yj)), error = function(e) NA_real_)
+}
+```
+
+## Plot helpers
+
+```{r}
+cols_detected <- c("Not Outlier" = "#1B4F72", "Detected Outlier" = "#E67E22")
+cols_true     <- c("Not Outlier" = "#1B4F72", "True Outlier"     = "#E67E22")
+
+sizes_default <- list(base = 10, title = 10, axis_title = 9, axis_text = 8, annot = 3,
+                      axis_titles = TRUE, label_top = FALSE)
+sizes_big     <- list(base = 9, title = 9.5, axis_title = 8.5, axis_text = 7.5, annot = 2.7,
+                      axis_titles = FALSE, label_top = TRUE)
+
+topgear_row_w <- 8
+topgear_row_h <- 2.3
+
+theme_toy <- function(sizes) {
+  theme_minimal(base_size = sizes$base) +
+    theme(
+      plot.title          = element_text(hjust = 0.5, face = "bold", size = sizes$title),
+      legend.position     = "none",
+      panel.grid.major    = element_blank(),
+      panel.grid.minor    = element_blank(),
+      axis.title          = if (isTRUE(sizes$axis_titles)) element_text(size = sizes$axis_title)
+                            else element_blank(),
+      axis.text           = element_text(size = sizes$axis_text),
+      axis.ticks.x        = element_line(color = "black", linewidth = 0.3),
+      axis.ticks.length.x = unit(-7, "pt")
+    )
+}
+
+norm_overlay <- function(n, binwidth) {
+  d <- data.frame(x = seq(-7, 7, length.out = 400))
+  d$y <- dnorm(d$x) * n * binwidth
+  d
+}
+```
+
+Transformed values coloured by each method's flags (Top Gear). Values are truncated at ±7, and the threshold on the original scale is printed next to each threshold line.
+
+```{r}
+build_plot_detected <- function(values, out_idx, title, threshold_label = NULL,
+                                lower_threshold_label = NULL, y_annot = NULL,
+                                tail = "both", sizes = sizes_default) {
+  keep  <- which(!is.na(values))
+  det   <- seq_along(values) %in% out_idx
+  vals  <- pmin(pmax(values[keep], -7), 7)
+  label <- factor(ifelse(det[keep], "Detected Outlier", "Not Outlier"),
+                  levels = c("Not Outlier", "Detected Outlier"))
+  y_annot <- if (is.null(y_annot)) max(hist(vals, breaks = 40, plot = FALSE)$counts) * 0.95 else y_annot
+
+  # labels either run up from y_annot, or hang down from the top of the panel
+  lab_y     <- if (isTRUE(sizes$label_top)) Inf else y_annot
+  lab_hjust <- if (isTRUE(sizes$label_top)) 1.05 else 0
+
+  binwidth <- 0.35
+  vlines   <- if (tail == "upper") 3 else if (tail == "lower") -3 else c(-3, 3)
+
+  p <- ggplot(data.frame(value = vals, label = label), aes(x = value, fill = label)) +
+    geom_histogram(color = "black", binwidth = binwidth) +
+    geom_line(data = norm_overlay(length(vals), binwidth), aes(x = x, y = y),
+              inherit.aes = FALSE, color = "red", linewidth = 0.8) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+    geom_vline(xintercept = vlines, linetype = "dotted", color = "darkred", linewidth = 0.3) +
+    scale_fill_manual(values = cols_detected, drop = FALSE) +
+    labs(title = title, x = "Transformed Values", y = "Count", fill = NULL) +
+    theme_toy(sizes) +
+    coord_cartesian(xlim = c(-7, 7))
+
+  add_label <- function(p, x, lab) {
+    p + annotate("text", x = x, y = lab_y,
+                 label = prettyNum(lab, big.mark = ",", scientific = FALSE),
+                 angle = 90, vjust = -0.5, hjust = lab_hjust, size = sizes$annot, color = "darkred")
+  }
+  if (!is.null(threshold_label)) p <- add_label(p, 3, threshold_label)
+  if (!is.null(lower_threshold_label) && tail != "upper") p <- add_label(p, -3, lower_threshold_label)
+  p
+}
+```
+
+Transformed values coloured by the known outliers (HBK, Wood). Values beyond ±7 are drawn at ±7 and coloured as outliers. The N(0, 1) curve is scaled to the number of inliers.
+
+```{r}
+build_plot_true <- function(values, true_out_idx, title) {
+  keep <- which(!is.na(values))
+  vals <- pmin(pmax(values[keep], -7), 7)
+  tag  <- rep("Not Outlier", length(vals))
+  tag[keep %in% true_out_idx] <- "True Outlier"
+  tag[vals <= -7 | vals >= 7] <- "True Outlier"
+
+  binwidth <- 0.35
+
+  ggplot(tibble(value = vals, label = factor(tag, levels = c("Not Outlier", "True Outlier"))),
+         aes(x = value, fill = label)) +
+    geom_histogram(color = "black", binwidth = binwidth) +
+    geom_line(data = norm_overlay(sum(tag == "Not Outlier"), binwidth), aes(x = x, y = y),
+              inherit.aes = FALSE, color = "red", linewidth = 0.8) +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+    geom_vline(xintercept = 3, linetype = "dotted", color = "darkred", linewidth = 0.4) +
+    scale_fill_manual(values = cols_true) +
+    labs(title = title, x = "Transformed Values", y = "Count", fill = NULL) +
+    theme_toy(sizes_default) +
+    coord_cartesian(xlim = c(-7, 7))
+}
+
+build_plot_original <- function(x, title, true_out_idx = NULL, sizes = sizes_default) {
+  if (!is.null(true_out_idx)) {
+    fill_var <- if_else(seq_along(x) %in% true_out_idx, "True Outlier", "Not Outlier")
+    cols_use <- cols_true
+  } else {
+    fill_var <- rep("Not Outlier", length(x))
+    cols_use <- c("Not Outlier" = "#1B4F72")
+  }
+  ggplot(data.frame(x = x, fill_var = fill_var), aes(x = x, fill = fill_var)) +
+    geom_histogram(bins = 40, color = "black") +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+    scale_fill_manual(values = cols_use) +
+    labs(title = title, x = "Value", y = "Count", fill = NULL) +
+    theme_toy(sizes)
+}
+
+save_row_plot <- function(plots, filepath, width = 11, height = 3) {
+  ggsave(filename = filepath, plot = plot_grid(plotlist = plots, nrow = 1),
+         width = width, height = height)
+}
+```
+
+Legend for Figure 8 (Not Outlier / Detected Outlier).
+
+```{r}
+save_status_legend <- function(file, labels = names(cols_detected), cols = unname(cols_detected)) {
+  W <- 1740; H <- 268   # pixels at 300 dpi
+  keys <- data.frame(xmin = c(81, 795), xmax = c(213, 927), ymin = 90, ymax = 222,
+                     fill = cols, label = labels, x_txt = c(272, 985))
+
+  p <- ggplot(keys) +
+    geom_rect(aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill)) +
+    geom_text(aes(x = x_txt, y = 156, label = label), hjust = 0, vjust = 0.5, size = 6.8) +
+    scale_fill_identity() +
+    coord_cartesian(xlim = c(0, W), ylim = c(0, H), expand = FALSE) +
+    theme_void() +
+    theme(plot.background = element_rect(fill = "white", colour = NA),
+          plot.margin     = margin(0, 0, 0, 0))
+
+  ggsave(file, p, width = W / 300, height = H / 300, dpi = 300)
+}
+
+save_status_legend(file.path(toy_dir, "status_legend_1X2.png"))
+```
+
+## Figure 8: Top Gear
+
+Weight is checked in both tails, MPG and Price in the upper tail.
+log(MPG) and log(Price) are fitted on the log scale, and their thresholds are converted back to MPG and pounds.
+`y_annot` is the height of the threshold labels.
+
+```{r}
+topgear_vars <- list(
+  MPG      = list(x = TopGear$MPG,        label = "MPG",        tail = "upper", log = FALSE, round_thr = FALSE, y_annot = 39),
+  Weight   = list(x = TopGear$Weight,     label = "Weight",     tail = "both",  log = FALSE, round_thr = TRUE,  y_annot = 29),
+  Price    = list(x = TopGear$Price,      label = "Price",      tail = "upper", log = FALSE, round_thr = TRUE,  y_annot = 19),
+  logMPG   = list(x = log(TopGear$MPG),   label = "log(MPG)",   tail = "upper", log = TRUE,  round_thr = FALSE, y_annot = 39),
+  logPrice = list(x = log(TopGear$Price), label = "log(Price)", tail = "upper", log = TRUE,  round_thr = TRUE,  y_annot = 19)
+)
+
+fmt_thr <- function(x, round_thr) if (is.na(x)) NULL else if (round_thr) round(x, 0) else round(x, 1)
+
+topgear_results <- list()
+
+for (var_name in names(topgear_vars)) {
+  cfg <- topgear_vars[[var_name]]
+  res <- run_all_methods(cfg$x, tail = cfg$tail, yj_type = "bestObj")
+  topgear_results[[var_name]] <- res
+
+  back  <- if (cfg$log) exp else identity
+  lower <- cfg$tail == "both"
+  thr <- list(
+    yj = c(back(yj_cutoff(res$YJ, 3)),         if (lower) back(yj_cutoff(res$YJ, -3)) else NA),
+    z  = c(back(shash_cutoff(res$SHASH.z, 3)), if (lower) back(shash_cutoff(res$SHASH.z, -3)) else NA),
+    i  = c(back(shash_cutoff(res$SHASH.i, 3)), if (lower) back(shash_cutoff(res$SHASH.i, -3)) else NA)
+  )
+  cat(cfg$label, "thresholds (upper, lower) | RewML:", round(thr$yj, 2),
+      "| SHASH-z:", round(thr$z, 2), "| SHASH-i:", round(thr$i, 2), "\n")
+
+  yj_z <- as.numeric(res$YJ$Y[, 1])
+  panel <- function(values, out_idx, title, t) {
+    build_plot_detected(values, out_idx, title,
+                        threshold_label       = fmt_thr(t[1], cfg$round_thr),
+                        lower_threshold_label = fmt_thr(t[2], cfg$round_thr),
+                        y_annot = cfg$y_annot, tail = cfg$tail, sizes = sizes_big)
+  }
+
+  save_row_plot(
+    list(build_plot_original(cfg$x, title = cfg$label, sizes = sizes_big),
+         panel(yj_z, flag_by_tail(yj_z, cfg$tail), "RewML Box-Cox/YJ", thr$yj),
+         panel(res$SHASH.z$x_norm, res$SHASH.z$out_idx, "SHASH-z", thr$z),
+         panel(res$SHASH.i$x_norm, res$SHASH.i$out_idx, "SHASH-i", thr$i)),
+    filepath = file.path(toy_dir, "TopGear", paste0("TopGear-", var_name, ".png")),
+    width = topgear_row_w, height = topgear_row_h
+  )
+}
+```
+
+## Figure 9: HBK
+
+All four variables are checked in the upper tail. Observations 1–14 are outliers in X1–X3, and 1–10 in Y.
+
+```{r}
+hbk_vars <- list(
+  X1 = list(x = hbk$X1, true_out = 1:14),
+  X2 = list(x = hbk$X2, true_out = 1:14),
+  X3 = list(x = hbk$X3, true_out = 1:14),
+  Y  = list(x = hbk$Y,  true_out = 1:10)
+)
+
+hbk_results <- list()
+
+for (var_name in names(hbk_vars)) {
+  cfg <- hbk_vars[[var_name]]
+  res <- run_all_methods(cfg$x, tail = "upper", yj_type = "YJ")
+  hbk_results[[var_name]] <- res
+
+  cat(var_name, "upper thresholds | RewML:", round(yj_cutoff(res$YJ, 3), 2),
+      "| SHASH-z:", round(shash_cutoff(res$SHASH.z, 3), 2),
+      "| SHASH-i:", round(shash_cutoff(res$SHASH.i, 3), 2), "\n")
+
+  save_row_plot(
+    list(build_plot_original(cfg$x, title = var_name, true_out_idx = cfg$true_out),
+         build_plot_true(as.numeric(res$YJ$Y[, 1]), cfg$true_out, "RewML Box-Cox/YJ"),
+         build_plot_true(res$SHASH.z$x_norm, cfg$true_out, "SHASH-z"),
+         build_plot_true(res$SHASH.i$x_norm, cfg$true_out, "SHASH-i")),
+    filepath = file.path(toy_dir, "HBK", paste0("HBK-", var_name, ".png"))
+  )
+}
+```
+
+## Figure 10 and Figure S.14: Wood
+
+Observations 4, 6, 8 and 19 are outliers. The methods are applied to the first robust principal component, checked in the upper tail.
+
+```{r}
+true_out_wood <- c(4, 6, 8, 19)
+
+png(file.path(toy_dir, "Wood", "Scatterplot-Matrix-Wood.png"), width = 3000, height = 3000, res = 500)
+par(las = 2)
+pairs(wood[, 1:5],
+      pch = 19, col = ifelse(seq_len(nrow(wood)) %in% true_out_wood, "#E67E22", "#1B4F72"),
+      cex = 1.4, gap = 0.5, oma = c(3, 3, 3, 3), cex.labels = 1.8, font.labels = 2,
+      upper.panel = NULL)
+dev.off()
+
+pca_wood <- rrcov::PcaHubert(wood[, 1:5], k = 5, scale = TRUE, signflip = TRUE)
+wood_pc1 <- as.data.frame(pca_wood@scores)$PC1
+
+res_wood <- run_all_methods(wood_pc1, tail = "upper", yj_type = "YJ")
+
+cat("Wood PC1 upper thresholds | RewML:", round(yj_cutoff(res_wood$YJ, 3), 2),
+    "| SHASH-z:", round(shash_cutoff(res_wood$SHASH.z, 3), 2),
+    "| SHASH-i:", round(shash_cutoff(res_wood$SHASH.i, 3), 2), "\n")
+
+save_row_plot(
+  list(build_plot_original(wood_pc1, title = "PC1", true_out_idx = true_out_wood),
+       build_plot_true(as.numeric(res_wood$YJ$Y[, 1]), true_out_wood, "RewML Box-Cox/YJ"),
+       build_plot_true(res_wood$SHASH.z$x_norm, true_out_wood, "SHASH-z"),
+       build_plot_true(res_wood$SHASH.i$x_norm, true_out_wood, "SHASH-i")),
+  filepath = file.path(toy_dir, "Wood", "WoodPC1-TrueOutliers.png")
+)
+```
+
+## Numbers quoted in the text
+
+Sample sizes for the Figure 8 caption (missing values are dropped per variable).
+
+```{r}
+sapply(TopGear[, c("MPG", "Weight", "Price")],
+       function(v) c(n_used = sum(!is.na(v)), n_missing = sum(is.na(v))))
+```
+
+Flags per method, with true and false positives where the outliers are known.
+
+```{r}
+summarize_detection <- function(label, res, tail, true_out_idx = NULL) {
+  flags <- list("RewML Box-Cox/YJ" = flag_by_tail(as.numeric(res$YJ$Y[, 1]), tail),
+                "SHASH-z"          = res$SHASH.z$out_idx,
+                "SHASH-i"          = res$SHASH.i$out_idx)
+  cat("\n===", label, "===\n")
+  for (m in names(flags)) {
+    f <- flags[[m]]
+    if (is.null(true_out_idx)) {
+      cat(m, "flagged:", length(f), "| rows:", paste(f, collapse = ", "), "\n")
+    } else {
+      cat(m, "flagged:", length(f),
+          "| TP:", length(intersect(f, true_out_idx)),
+          "| FP:", length(setdiff(f, true_out_idx)),
+          "| missed:", paste(setdiff(true_out_idx, f), collapse = ", "), "\n")
+    }
+  }
+}
+
+for (v in names(topgear_vars))
+  summarize_detection(topgear_vars[[v]]$label, topgear_results[[v]], topgear_vars[[v]]$tail)
+for (v in names(hbk_vars))
+  summarize_detection(paste("HBK", v), hbk_results[[v]], "upper", hbk_vars[[v]]$true_out)
+summarize_detection("Wood PC1", res_wood, "upper", true_out_wood)
+```
+
+Top Gear: the five lightest flagged vehicles for Weight, and the most expensive vehicles for Price.
+
+```{r}
+w_ok <- !is.na(TopGear$Weight)
+tg   <- TopGear[w_ok, ]
+res  <- topgear_results$Weight
+flag <- list("RewML"   = flag_by_tail(as.numeric(res$YJ$Y[, 1]), "both"),
+             "SHASH-z" = res$SHASH.z$out_idx,
+             "SHASH-i" = res$SHASH.i$out_idx)
+
+imap_dfr(flag, function(idx, m) {
+  tibble(method = m, Maker = tg$Maker[idx], Model = tg$Model[idx], Weight = tg$Weight[idx])
+}) %>%
+  arrange(Weight) %>%
+  print(n = 50)
+
+# same vehicles for all three methods?
+Reduce(intersect, flag)
+
+TopGear %>% arrange(desc(Price)) %>% dplyr::select(Maker, Model, Price) %>% head(5)
+```
+
+HBK: the iForest+ initialization for X1 and X2. For X2 the smallest flagged value is 23, so the outliers below it are not initialized.
+
+```{r}
+map_dfr(c("X1", "X2"), function(v) {
+  init <- rrobot::outlier_init(hbk[[v]], method = "isoplus", thr_iso = 0.6, tail = "upper")
+  tibble(variable     = v,
+         flagged_init = paste(which(!init$weight_new), collapse = ","),
+         cutoff_upper = init$cutoff_upper)
+})
+```
+
+Degenerate fits (more than 1% of transformed values beyond |z| = 20).
+Top Gear Price is degenerate for SHASH-z; the HBK spikes at 7 are degenerate fits.
+
+```{r}
+stopifnot("max_abs_z" %in% names(formals(rrobot::SHASH_out)))   # needs the rrobot degeneracy check
+
+all_fits <- c(
+  set_names(topgear_results, paste("TopGear", map_chr(topgear_vars, "label"))),
+  set_names(hbk_results, paste("HBK", names(hbk_results))),
+  list("Wood PC1" = res_wood)
+)
+true_outs <- c(set_names(rep(list(NULL), length(topgear_vars)), paste("TopGear", map_chr(topgear_vars, "label"))),
+               set_names(map(hbk_vars, "true_out"), paste("HBK", names(hbk_vars))),
+               list("Wood PC1" = true_out_wood))
+
+imap_dfr(all_fits, function(res, label) {
+  map_dfr(c("SHASH.z", "SHASH.i"), function(m) {
+    f   <- res[[m]]
+    big <- which(abs(f$x_norm) > 20)
+    to  <- true_outs[[label]]
+    tibble(
+      data        = label,
+      method      = sub("SHASH.", "SHASH-", m, fixed = TRUE),
+      degenerate  = isTRUE(f$degenerate),
+      max_abs_z   = round(f$max_abs_z, 1),
+      n_extreme   = f$n_extreme,
+      n_flagged   = length(f$out_idx),
+      extreme_all_true_out = if (is.null(to) || !length(big)) NA else all(big %in% to)
+    )
+  })
+}) %>%
+  print(n = 30, width = Inf)
+```
