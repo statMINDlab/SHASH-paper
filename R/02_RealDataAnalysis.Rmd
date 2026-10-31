@@ -28,9 +28,7 @@ library(rrcov)
 library(cellWise)
 library(rrobot)
 
-plot_dir <- "~/Documents/Github/SHASH-paper/plots/"
-# data_dir <- "~/Documents/Github/SHASH-paper/data/"
-devtools::load_all("~/Documents/Github/rrobot")
+plot_dir <- "plots"
 
 toy_dir  <- file.path(plot_dir, "thr3", "ToyDatasets")
 for (d in c("TopGear", "HBK", "Wood")) dir.create(file.path(toy_dir, d), recursive = TRUE, showWarnings = FALSE)
