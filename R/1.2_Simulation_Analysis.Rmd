@@ -1,0 +1,598 @@
+---
+title: "1.2 Simulation analysis"
+author: "Saranjeet Singh Saluja"
+output: html_notebook
+---
+
+Results of simulation study 2, from the output of `1.1.2_Simulation_Fitting.Rmd`:
+
+- Figure 7: TPR and FPR by method and distribution
+- Figure 6 and Figures S.4–S.9: example histograms by contamination level
+- Figure S.1: iForest+ initialization
+- Degenerate fit counts and their effect on TPR and FPR (Section 3.2)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cowplot)
+library(arrow)
+library(cellWise)
+library(rrobot)
+
+plot_dir <- "plots"
+data_dir <- "data"
+
+pct_levels  <- c("1%", "5%", "10%", "20%", "30%")
+dist_levels <- c("Normal", "T", "Laplace", "Gamma", "Chi-Square", "Weibull")
+dist_recode <- c(df_normal = "Normal", df_T = "T", df_laplace = "Laplace",
+                 df_gamma = "Gamma", df_chisq = "Chi-Square", df_weibull = "Weibull")
+
+tail_type <- function(dist_name) {
+  if (dist_name %in% c("df_T", "df_laplace", "df_normal")) "both" else "upper"
+}
+```
+
+## Data
+
+```{r}
+df_results_combined <- read_parquet(file.path(data_dir, "simulation_results_metadata.parquet")) %>%
+  mutate(percentage = factor(percentage, levels = pct_levels))
+
+df_diag <- read_parquet(file.path(data_dir, "simulation_diagnostics.parquet")) %>%
+  mutate(percentage = factor(as.character(percentage), levels = pct_levels))
+```
+
+## Exclusion flags
+
+A SHASH fit is excluded if it is degenerate (more than 1% of transformed values beyond |z| = 20) or if `gamlssML` failed.
+Optimizer singular convergence is recorded but not excluded.
+
+```{r}
+df_diag <- df_diag %>%
+  mutate(
+    excl_degen   = degenerate %in% TRUE,
+    excl_failed  = fit_failed %in% TRUE,
+    excl_optsing = optim_singular %in% TRUE,
+    excluded     = excl_degen | excl_failed
+  )
+
+failure_summ <- function(d) {
+  d %>%
+    summarise(
+      n_fits       = n(),
+      n_degen      = sum(excl_degen),
+      pct_degen    = round(100 * mean(excl_degen), 2),
+      n_failed     = sum(excl_failed),
+      n_optsing    = sum(excl_optsing),
+      pct_optsing  = round(100 * mean(excl_optsing), 2),
+      n_excluded   = sum(excluded),
+      pct_excluded = round(100 * mean(excluded), 2),
+      n_retained   = sum(!excluded),
+      .groups = "drop"
+    )
+}
+```
+
+Degenerate rates by iForest threshold (Section 3.2: 1.3%, 5.3% and 11.2% for SHASH-i at 0.6, 0.55 and 0.5, contamination 1–20%).
+
+```{r}
+df_diag %>%
+  filter(method %in% c("SHASH-i", "SHASH-z"), thr1 == 3, percentage != "30%") %>%
+  group_by(method, threshold) %>%
+  failure_summ() %>%
+  print(width = Inf)
+```
+
+Settings used in the paper (thr1 = 3, iForest threshold 0.6).
+
+```{r}
+diag_paper <- df_diag %>%
+  filter(method %in% c("SHASH-i", "SHASH-z"), thr1 == 3, threshold == 0.6) %>%
+  mutate(distribution = recode(distribution, !!!dist_recode))
+
+# per distribution and contamination level
+diag_paper %>%
+  group_by(distribution, percentage, method) %>%
+  failure_summ() %>%
+  arrange(desc(percentage), distribution) %>%
+  print(n = 100, width = Inf)
+
+# overall, contamination 1–20% (310 SHASH-i and 166 SHASH-z fits)
+diag_paper %>%
+  filter(percentage != "30%") %>%
+  group_by(method) %>%
+  failure_summ() %>%
+  print(width = Inf)
+
+# number excluded per cell
+diag_paper %>%
+  filter(percentage != "30%") %>%
+  mutate(distribution = factor(distribution, levels = dist_levels)) %>%
+  group_by(method, distribution, percentage) %>%
+  summarise(n_removed = sum(excluded), .groups = "drop") %>%
+  pivot_wider(names_from = percentage, values_from = n_removed) %>%
+  mutate(total = `1%` + `5%` + `10%` + `20%`) %>%
+  arrange(method, distribution) %>%
+  print(n = 20)
+```
+
+Join the exclusion flags (thr1 = 3) onto the per-observation table.
+
+```{r}
+excl_wide <- df_diag %>%
+  filter(method %in% c("SHASH-i", "SHASH-z"), thr1 == 3) %>%
+  mutate(col = ifelse(method == "SHASH-i", "excl_i_thr3", "excl_z_thr3")) %>%
+  dplyr::select(simulation, distribution, threshold, percentage, col, excluded) %>%
+  distinct() %>%
+  pivot_wider(names_from = col, values_from = excluded)
+
+stopifnot(nrow(excl_wide) ==
+          nrow(distinct(excl_wide, simulation, distribution, threshold, percentage)))
+
+df_results_combined <- df_results_combined %>%
+  left_join(excl_wide, by = c("simulation", "distribution", "threshold", "percentage"))
+
+cat("rows with no matching diagnostics (SHASH-i):", sum(is.na(df_results_combined$excl_i_thr3)), "\n")
+```
+
+## TPR and FPR
+
+TPR and FPR per simulated dataset. Excluded SHASH fits are set to NA; robust z-scoring and RewML involve no SHASH fit and are never excluded.
+
+```{r}
+df_metrics <- df_results_combined %>%
+  group_by(simulation, distribution, percentage, threshold) %>%
+  summarise(
+    TPR_i_thr3 = if (first(excl_i_thr3) %in% TRUE) NA_real_
+                 else sum(flagged_i_thr3 &  true_outliers) / sum(true_outliers),
+    FPR_i_thr3 = if (first(excl_i_thr3) %in% TRUE) NA_real_
+                 else sum(flagged_i_thr3 & !true_outliers) / sum(!true_outliers),
+    TPR_z_thr3 = if (first(excl_z_thr3) %in% TRUE) NA_real_
+                 else sum(flagged_z_thr3 &  true_outliers) / sum(true_outliers),
+    FPR_z_thr3 = if (first(excl_z_thr3) %in% TRUE) NA_real_
+                 else sum(flagged_z_thr3 & !true_outliers) / sum(!true_outliers),
+    TPR_flagged_rryj    = sum(flagged_rryj    &  true_outliers) / sum(true_outliers),
+    FPR_flagged_rryj    = sum(flagged_rryj    & !true_outliers) / sum(!true_outliers),
+    TPR_flagged_emprule = sum(flagged_emprule &  true_outliers) / sum(true_outliers),
+    FPR_flagged_emprule = sum(flagged_emprule & !true_outliers) / sum(!true_outliers),
+    .groups = "drop"
+  ) %>%
+  mutate(distribution = recode(distribution, !!!dist_recode))
+
+method_recode <- c(z_thr3 = "SHASH_z_thr1_3", i_thr3 = "SHASH_i_thr1_3",
+                   flagged_emprule = "Robust Z-Scoring", flagged_rryj = "RewML Box-Cox/YJ")
+
+mean_by_method <- function(prefix) {
+  df_metrics %>%
+    pivot_longer(cols = starts_with(paste0(prefix, "_")), names_to = "method",
+                 names_prefix = paste0(prefix, "_"), values_to = "value") %>%
+    mutate(method = recode(method, !!!method_recode)) %>%
+    group_by(distribution, percentage, threshold, method) %>%
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+    mutate(distribution = factor(distribution, levels = dist_levels))
+}
+
+dftpr <- mean_by_method("TPR")
+dffpr <- mean_by_method("FPR")
+```
+
+## Figure 7
+
+```{r, fig.width = 10, fig.height = 5}
+perf_m <- bind_rows(
+  dffpr %>% mutate(Metric = "FPR"),
+  dftpr %>% mutate(Metric = "TPR")
+) %>%
+  filter(threshold == 0.6, percentage != "30%") %>%
+  mutate(
+    method = factor(method, levels = c("Robust Z-Scoring", "RewML Box-Cox/YJ",
+                                       "SHASH_z_thr1_3", "SHASH_i_thr1_3")),
+    Metric = factor(Metric, levels = c("TPR", "FPR"))
+  )
+
+method_labels <- c(
+  "Robust Z-Scoring" = "Robust Z-Scoring",
+  "RewML Box-Cox/YJ" = "RewML Box-Cox/YJ",
+  "SHASH_z_thr1_3"   = "SHASH-z",
+  "SHASH_i_thr1_3"   = "SHASH-i"
+)
+
+# symmetric distributions: filled symbols, blues; skewed: open symbols, warm colours
+dist_colors <- c("Normal" = "#08306B", "T" = "#0072B2", "Laplace" = "#56B4E9",
+                 "Gamma" = "#D55E00", "Chi-Square" = "#E69F00", "Weibull" = "#CC79A7")
+dist_shapes <- c("Normal" = 16, "T" = 17, "Laplace" = 15,
+                 "Gamma" = 1, "Chi-Square" = 2, "Weibull" = 0)
+
+# nominal FPR: 0.003 two-sided (dashed), 0.00135 one-sided (dotted)
+ref_lines <- data.frame(
+  Metric = factor("FPR", levels = c("TPR", "FPR")),
+  yint   = c(0.003, 0.00135),
+  type   = factor(c("two-sided", "one-sided"), levels = c("two-sided", "one-sided"))
+)
+
+p_m <- ggplot(perf_m, aes(x = percentage, y = mean_value,
+                          color = distribution, shape = distribution, group = distribution)) +
+  geom_hline(data = ref_lines, aes(yintercept = yint, linetype = type),
+             colour = "grey30", linewidth = 0.4, show.legend = FALSE) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 2, stroke = 0.8) +
+  facet_grid(Metric ~ method, scales = "free_y", labeller = labeller(method = method_labels)) +
+  scale_color_manual(values = dist_colors, name = NULL) +
+  scale_shape_manual(values = dist_shapes, name = NULL) +
+  scale_linetype_manual(values = c("two-sided" = "dashed", "one-sided" = "dotted"), guide = "none") +
+  guides(color = guide_legend(nrow = 1), shape = guide_legend(nrow = 1)) +
+  labs(x = "Outlier Percentage", y = "Mean Value") +
+  theme_bw(base_size = 10) +
+  theme(
+    legend.position  = "bottom",
+    axis.text.x      = element_text(size = 10, angle = 45, hjust = 1),
+    axis.text.y      = element_text(size = 10),
+    axis.title       = element_text(size = 11),
+    strip.text       = element_text(face = "bold", size = 10),
+    legend.text      = element_text(size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+p_m
+
+dir.create(file.path(plot_dir, "thr3", "Performance"), recursive = TRUE, showWarnings = FALSE)
+ggsave(filename = "FPR_TPR_byMethod_sans_30.png", plot = p_m,
+       path = file.path(plot_dir, "thr3", "Performance"),
+       width = 10, height = 5, dpi = 600)
+```
+
+## Effect of excluding degenerate fits
+
+Section 3.2: excluding degenerate fits changes mean TPR and FPR by less than 0.001 overall.
+`metrics_raw` has no exclusions applied.
+
+```{r}
+metrics_raw <- df_results_combined %>%
+  group_by(simulation, distribution, percentage, threshold) %>%
+  summarise(
+    TPR_i = sum(flagged_i_thr3 &  true_outliers) / sum(true_outliers),
+    FPR_i = sum(flagged_i_thr3 & !true_outliers) / sum(!true_outliers),
+    TPR_z = sum(flagged_z_thr3 &  true_outliers) / sum(true_outliers),
+    FPR_z = sum(flagged_z_thr3 & !true_outliers) / sum(!true_outliers),
+    .groups = "drop"
+  )
+
+fit_flags <- df_diag %>%
+  filter(method %in% c("SHASH-i", "SHASH-z"), thr1 == 3, threshold == 0.6) %>%
+  dplyr::select(simulation, distribution, threshold, percentage, method, excl_degen)
+
+perf_long <- metrics_raw %>%
+  filter(threshold == 0.6) %>%
+  pivot_longer(cols = c(TPR_i, FPR_i, TPR_z, FPR_z),
+               names_to = c(".value", "method"), names_sep = "_") %>%
+  mutate(method = recode(method, i = "SHASH-i", z = "SHASH-z")) %>%
+  left_join(fit_flags, by = c("simulation", "distribution", "threshold", "percentage", "method")) %>%
+  mutate(distribution = recode(distribution, !!!dist_recode))
+
+stopifnot(!anyNA(perf_long$excl_degen))
+
+# mean TPR and FPR over all fits, kept fits and flagged fits
+with_without <- function(d, flag) {
+  d %>%
+    summarise(
+      n_fits   = n(),
+      n_flag   = sum({{ flag }}),
+      pct_flag = round(100 * mean({{ flag }}), 2),
+      TPR_all  = mean(TPR, na.rm = TRUE),
+      TPR_kept = mean(TPR[!{{ flag }}], na.rm = TRUE),
+      TPR_flag = mean(TPR[{{ flag }}], na.rm = TRUE),
+      FPR_all  = mean(FPR, na.rm = TRUE),
+      FPR_kept = mean(FPR[!{{ flag }}], na.rm = TRUE),
+      FPR_flag = mean(FPR[{{ flag }}], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(dTPR = round(TPR_kept - TPR_all, 4),
+           dFPR = round(FPR_kept - FPR_all, 5),
+           across(c(TPR_all, TPR_kept, TPR_flag), ~ round(.x, 3)),
+           across(c(FPR_all, FPR_kept, FPR_flag), ~ round(.x, 4)))
+}
+
+# overall, contamination 1–20%
+perf_long %>%
+  filter(percentage != "30%") %>%
+  group_by(method) %>%
+  with_without(excl_degen) %>%
+  print(width = Inf)
+
+# cells with any degenerate fit, largest FPR change first
+perf_long %>%
+  filter(percentage != "30%") %>%
+  group_by(method, distribution, percentage) %>%
+  with_without(excl_degen) %>%
+  filter(n_flag > 0) %>%
+  dplyr::select(method, distribution, percentage, n_flag, pct_flag,
+                FPR_all, FPR_kept, dFPR, TPR_all, TPR_kept, dTPR) %>%
+  arrange(desc(abs(dFPR))) %>%
+  print(n = 30, width = Inf)
+```
+
+## Histograms: Figure 6 and Figures S.4–S.9
+
+For each contamination level and distribution, one simulated dataset is drawn at random and refit.
+A dataset is used only if RewML, SHASH-z and SHASH-i all give a valid, non-degenerate fit; otherwise another is drawn.
+Figure 6 is the 10% set.
+
+```{r}
+distributions <- intersect(c("df_normal", "df_T", "df_laplace", "df_gamma", "df_chisq", "df_weibull"),
+                           unique(df_results_combined$distribution))
+perc_list <- intersect(c("1%", "5%", "10%", "20%"), as.character(unique(df_results_combined$percentage)))
+selected_threshold <- 0.6
+
+distribution_names <- c(df_normal = "Normal", df_T = "T", df_laplace = "Laplace",
+                        df_gamma = "Gamma", df_chisq = "Chisquare", df_weibull = "Weibull")
+
+method_names <- c(
+  "flagged_emprule"       = "Robust Z-Scoring",
+  "flagged_rryj"          = "RewML Box-Cox/YJ",
+  "flagged_shash_z"       = "SHASH-z",
+  "flagged_shash_isoplus" = "SHASH-i"
+)
+
+stopifnot("max_abs_z" %in% names(formals(rrobot::SHASH_out)))   # needs the rrobot degeneracy check
+
+valid_shash_fit <- function(fit) {
+  if (is.null(fit)) return(FALSE)
+  if (is.null(fit$x_norm) || length(fit$x_norm) == 0L) return(FALSE)
+  !isTRUE(fit$degenerate)
+}
+```
+
+```{r}
+hist_transform <- function(sim_data, dist_name) {
+  x    <- unlist(sim_data$outlier_infused_values)
+  tail <- tail_type(dist_name)
+
+  yj_trans <- tryCatch(
+    as.numeric(cellWise::transfo(x, type = "bestObj", robust = TRUE, standardize = TRUE)$Y),
+    error = function(e) NULL
+  )
+  yj_valid <- !is.null(yj_trans) && length(yj_trans) == length(x) && all(is.finite(yj_trans))
+  yj_idx <- if (!yj_valid) integer(0)
+            else if (tail == "upper") which(yj_trans > 3)
+            else which(abs(yj_trans) > 3)
+
+  fit <- function(method_init) {
+    tryCatch(rrobot::SHASH_out(x, thr0 = 2.58, thr1 = 3, thr = 3, tail = tail,
+                               method_init = method_init, thr_iso = selected_threshold,
+                               maxit = 100),
+             error = function(e) NULL)
+  }
+  shash_z <- fit("emprule")
+  shash_i <- fit("isoplus")
+
+  shash_z_valid <- valid_shash_fit(shash_z)
+  shash_i_valid <- valid_shash_fit(shash_i)
+
+  list(
+    success      = yj_valid && shash_z_valid && shash_i_valid,
+    yj_trans     = if (yj_valid) yj_trans else NULL,
+    yj_idx       = yj_idx,
+    shash_z_norm = if (shash_z_valid) shash_z$x_norm else NULL,
+    shash_i_norm = if (shash_i_valid) shash_i$x_norm else NULL,
+    shash_z_idx  = if (shash_z_valid) shash_z$out_idx else integer(0),
+    shash_i_idx  = if (shash_i_valid) shash_i$out_idx else integer(0)
+  )
+}
+
+# random simulation, drawn without replacement until all three fits are valid
+pick_working_sim <- function(selected_data, dist_name) {
+  candidates <- selected_data %>%
+    filter(distribution == dist_name) %>%
+    pull(simulation) %>%
+    unique() %>%
+    sample()
+
+  for (sim in candidates) {
+    sim_data <- selected_data %>% filter(distribution == dist_name, simulation == sim)
+    trans <- hist_transform(sim_data, dist_name)
+    if (trans$success) return(list(sim = sim, sim_data = sim_data, trans = trans))
+    message("Sim ", sim, " failed for ", dist_name, "; drawing another.")
+  }
+  stop("No simulation with valid fits for ", dist_name)
+}
+
+# warn if the refit flags differ from the stored flags
+verify_flags <- function(sim_data, trans, dist_name, sim_num, perc) {
+  n <- nrow(sim_data)
+  checks <- list(
+    "SHASH-z" = list(new = seq_len(n) %in% trans$shash_z_idx, col = "flagged_z_thr3"),
+    "SHASH-i" = list(new = seq_len(n) %in% trans$shash_i_idx, col = "flagged_i_thr3"),
+    "RewML"   = list(new = seq_len(n) %in% trans$yj_idx,      col = "flagged_rryj")
+  )
+  for (nm in names(checks)) {
+    old <- sim_data[[checks[[nm]]$col]]
+    if (all(is.na(old))) {
+      warning(nm, ": stored flags all NA (", dist_name, " sim ", sim_num, ")")
+      next
+    }
+    nd <- sum(xor(checks[[nm]]$new, old), na.rm = TRUE)
+    if (nd > 0) warning(nm, " mismatch: ", nd, "/", n, " differ (", dist_name,
+                        " sim ", sim_num, " perc ", perc, ")")
+  }
+}
+```
+
+```{r}
+hist_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 12),
+    legend.position = "none",
+    panel.grid      = element_blank(),
+    axis.title.x    = element_text(size = 12),
+    axis.text.x     = element_text(size = 12),
+    axis.title.y    = element_blank(),
+    axis.text.y     = element_blank(),
+    axis.ticks.y    = element_blank()
+  )
+outlier_fill <- scale_fill_manual(values = c("Non-Outlier" = "#1B4F72", "Outlier" = "#E67E22"))
+
+build_orig_plot <- function(sim_data) {
+  df <- data.frame(x = unlist(sim_data$outlier_infused_values),
+                   outlier = ifelse(unlist(sim_data$true_outliers), "Outlier", "Non-Outlier"))
+  ggplot(df, aes(x = x, fill = outlier)) +
+    geom_histogram(bins = 40, color = "black", linewidth = 0.2) +
+    outlier_fill +
+    labs(title = "Outlier-Infused Values", x = "Original Values") +
+    hist_theme
+}
+
+# histogram on the transformed scale with the N(0, 1) density and the ±3 thresholds;
+# the x-axis is cut at 100 when values go beyond it
+build_transf_plot <- function(transformed_values, true_outliers, title, dist_name) {
+  vlines <- if (tail_type(dist_name) == "upper") 3 else c(-3, 3)
+
+  df <- data.frame(x = transformed_values,
+                   outlier = ifelse(true_outliers, "Outlier", "Non-Outlier"))
+  binwidth <- diff(range(df$x)) / 40
+
+  norm_curve <- data.frame(x = seq(min(df$x), max(df$x), length.out = 400))
+  norm_curve$y <- dnorm(norm_curve$x) * nrow(df) * binwidth
+
+  x_upper <- if (max(transformed_values, na.rm = TRUE) > 100) 100 else NA
+
+  ggplot(df, aes(x = x, fill = outlier)) +
+    geom_histogram(bins = 40, color = "black", linewidth = 0.2) +
+    geom_line(data = norm_curve, aes(x = x, y = y), inherit.aes = FALSE,
+              color = "red", linewidth = 0.3) +
+    outlier_fill +
+    geom_vline(xintercept = vlines, linetype = "dashed", color = "black", linewidth = 0.7) +
+    labs(title = title, x = "Transformed Values") +
+    coord_cartesian(xlim = c(NA, x_upper)) +
+    hist_theme
+}
+```
+
+```{r}
+set.seed(42)
+
+chosen_sims_log <- list()   # simulation used for each contamination level and distribution
+
+for (perc in perc_list) {
+  perc_label <- gsub("%", "Percent", perc)
+  out_dir <- file.path(plot_dir, "thr3", "Histograms", "VaryingPercentage", perc_label)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  selected_data <- df_results_combined %>%
+    filter(percentage == perc, threshold == selected_threshold)
+
+  for (dist in distributions) {
+    picked   <- pick_working_sim(selected_data, dist)
+    sim_data <- picked$sim_data
+    trans    <- picked$trans
+    chosen_sims_log[[paste(perc, dist, sep = "_")]] <- picked$sim
+
+    verify_flags(sim_data, trans, dist, picked$sim, perc)
+
+    x  <- unlist(sim_data$outlier_infused_values)
+    to <- unlist(sim_data$true_outliers)
+    emp_trans <- (x - median(x)) / mad(x)
+
+    row_plot <- plot_grid(
+      build_orig_plot(sim_data),
+      build_transf_plot(emp_trans,          to, method_names[["flagged_emprule"]],       dist),
+      build_transf_plot(trans$yj_trans,     to, method_names[["flagged_rryj"]],          dist),
+      build_transf_plot(trans$shash_z_norm, to, method_names[["flagged_shash_z"]],       dist),
+      build_transf_plot(trans$shash_i_norm, to, method_names[["flagged_shash_isoplus"]], dist),
+      nrow = 1
+    )
+    ggsave(file.path(out_dir, paste0(distribution_names[[dist]], "-methods.png")),
+           plot = row_plot, width = 15, height = 3)
+  }
+}
+
+print(unlist(chosen_sims_log))
+```
+
+## Figure S.1: iForest+ initialization
+
+Uses the datasets chosen for the histograms. The paper shows Normal and Gamma at 20%.
+
+```{r}
+build_iforest_init_plot <- function(x, true_outliers, dist_name, thr_iso = 0.6) {
+  tail <- tail_type(dist_name)
+  init <- outlier_init(x, method = "isoplus", thr_iso = thr_iso, tail = tail, seed = 1)
+
+  plot_df <- data.frame(x = x, iso = init$iso_scores,
+                        outlier = ifelse(true_outliers, "True Outlier", "Inlier"))
+
+  lower <- if (tail %in% c("both", "lower") && is.finite(init$cutoff_lower)) init$cutoff_lower else NA_real_
+  upper <- if (tail %in% c("both", "upper") && is.finite(init$cutoff_upper)) init$cutoff_upper else NA_real_
+  cut_lines <- c(lower, upper)
+  cut_lines <- cut_lines[!is.na(cut_lines)]
+
+  y_rng <- range(plot_df$iso, na.rm = TRUE)
+  y_lab <- y_rng[1] + 0.18 * diff(y_rng)
+
+  p <- ggplot(plot_df, aes(x = x, y = iso))
+
+  # shade the flagged region(s)
+  if (!is.na(lower)) p <- p + annotate("rect", xmin = -Inf, xmax = lower, ymin = -Inf, ymax = Inf,
+                                       fill = "grey85", alpha = 0.6)
+  if (!is.na(upper)) p <- p + annotate("rect", xmin = upper, xmax = Inf, ymin = -Inf, ymax = Inf,
+                                       fill = "grey85", alpha = 0.6)
+
+  p <- p +
+    geom_point(aes(color = outlier, shape = outlier), size = 1.3, stroke = 0.7, alpha = 0.9) +
+    scale_color_manual(values = c("Inlier" = "#3B6EA5", "True Outlier" = "tomato")) +
+    scale_shape_manual(values = c("Inlier" = 16, "True Outlier" = 4)) +
+    geom_vline(xintercept = cut_lines, linetype = "dashed", color = "black", linewidth = 0.5)
+
+  for (v in cut_lines) {
+    p <- p + annotate("text", x = v, y = y_lab, label = "iForest+ threshold",
+                      angle = 90, vjust = -0.5, hjust = 0.5, color = "black", size = 3.2)
+  }
+
+  p +
+    labs(x = "Outlier-infused values", y = "Isolation forest score", color = NULL, shape = NULL) +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "none", panel.grid = element_blank(),
+          axis.title = element_text(size = 11), axis.text = element_text(size = 9),
+          plot.margin = margin(4, 8, 4, 4))
+}
+
+for (perc in perc_list) {
+  out_dir <- file.path(plot_dir, "thr3", "iForestInit", "Manuscript", gsub("%", "Percent", perc))
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  for (dist in distributions) {
+    sim <- chosen_sims_log[[paste(perc, dist, sep = "_")]]
+    sim_data <- df_results_combined %>%
+      filter(distribution == dist, simulation == sim,
+             percentage == perc, threshold == selected_threshold)
+
+    p <- build_iforest_init_plot(unlist(sim_data$outlier_infused_values),
+                                 unlist(sim_data$true_outliers), dist,
+                                 thr_iso = selected_threshold)
+    ggsave(file.path(out_dir, paste0(distribution_names[[dist]], "-iForestInit.png")),
+           p, width = 6, height = 4, dpi = 400)
+  }
+}
+```
+
+Legend for Figure S.1.
+
+```{r}
+legend_df <- data.frame(x = c(1, 2), y = c(1, 1), outlier = c("Inlier", "True Outlier"))
+
+p_legend_src <- ggplot(legend_df, aes(x = x, y = y, color = outlier, shape = outlier)) +
+  geom_point(size = 2, stroke = 1) +
+  scale_color_manual(values = c("Inlier" = "#3B6EA5", "True Outlier" = "tomato")) +
+  scale_shape_manual(values = c("Inlier" = 16, "True Outlier" = 4)) +
+  labs(color = NULL, shape = NULL) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom", legend.direction = "horizontal")
+
+ggsave(file.path(plot_dir, "thr3", "iForestInit", "Legend.png"),
+       ggdraw(cowplot::get_legend(p_legend_src)),
+       width = 5, height = 0.6, dpi = 400, bg = "white")
+```
