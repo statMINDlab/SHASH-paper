@@ -24,8 +24,8 @@ library(arrow)
 library(cellWise)
 library(rrobot)
 
-plot_dir <- "plots"
-data_dir <- "data"
+plot_dir <- "../plots"
+data_dir <- "../data"
 
 pct_levels  <- c("1%", "5%", "10%", "20%", "30%")
 dist_levels <- c("Normal", "T", "Laplace", "Gamma", "Chi-Square", "Weibull")
