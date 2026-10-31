@@ -1,0 +1,274 @@
+---
+title: "1.1.1 SHASH demonstrations"
+author: "Saranjeet Singh Saluja"
+output: html_notebook
+---
+
+Manuscript Figures 1, 2 and 3, and the SHASH parameter estimates shown under Figure 2.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(gamlss)
+library(gamlss.dist)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(ggthemes)
+library(vsgoftest)
+library(cowplot)
+library(ggpubr)
+library(rrobot)   # remotes::install_github("mandymejia/rrobot")
+
+plot_dir <- "plots"
+
+save_plot <- function(p, filename, subdir, width = 2, height = 2, ...) {
+  path <- file.path(plot_dir, subdir)
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  ggsave(filename = filename, plot = p, path = path, width = width, height = height, ...)
+}
+```
+
+## SHASH parameter estimates (Figure 2, bottom row)
+
+SHASH fitted by maximum likelihood to 100,000 draws from each distribution.
+`coefAll()` returns sigma and tau on the log scale.
+
+```{r}
+set.seed(123)
+
+n_shash  <- 100000
+dist_fit <- c("df_normal", "df_T", "df_laplace", "df_gamma", "df_chisq", "df_weibull")
+
+df_dist_fit <- map_dfr(dist_fit, function(dist_name) {
+  x <- switch(dist_name,
+              df_normal  = rnorm(n_shash, 10, 3),
+              df_T       = rt(n_shash, df = 4),
+              df_laplace = vsgoftest::rlaplace(n_shash, mu = 0, b = 3),
+              df_gamma   = rgamma(n_shash, shape = 2, scale = 1),
+              df_chisq   = rchisq(n_shash, df = 3),
+              df_weibull = rweibull(n_shash, shape = 1, scale = 3))
+  tibble(x = x, dist = dist_name)
+})
+
+fits <- map(dist_fit, function(dist_name) {
+  x <- df_dist_fit$x[df_dist_fit$dist == dist_name]
+  gamlssML(x ~ 1, family = "SHASHo2", maxit = 10000)
+})
+names(fits) <- dist_fit
+
+param_df <- map2_dfr(dist_fit, fits, function(dist_name, fit) {
+  est <- coefAll(fit)
+  tibble(dist = dist_name, mu = est$mu, sigma = est$sigma, nu = est$nu, tau = est$tau)
+})
+
+param_df   # sigma and tau on the log scale
+
+param_df %>%
+  mutate(sigma = exp(sigma), tau = exp(tau))   # natural scale, as reported under Figure 2
+```
+
+## Figure 1: SHASH distributional shapes
+
+```{r}
+set.seed(123)
+
+n <- 100000
+
+param_tbl <- tibble(
+  mu    = 0,
+  sigma = 1,
+  nu    = c(0, 0, 0, -2, 2),
+  tau   = c(10, 0.5, 1, 1, 1),
+  dist  = c("light-tailed", "heavy-tailed", "normal", "left-skewed", "right-skewed")
+)
+
+df_dist_shapes <- param_tbl %>%
+  mutate(x = pmap(list(mu, sigma, nu, tau),
+                  ~ rSHASHo2(n = n, mu = ..1, sigma = ..2, nu = ..3, tau = ..4))) %>%
+  dplyr::select(dist, x) %>%
+  unnest(x) %>%
+  mutate(dist = factor(dist, levels = param_tbl$dist))
+
+plot_shapes <- function(df, folder) {
+  for (d in levels(df$dist)) {
+    df_d <- filter(df, dist == d)
+    th <- theme_few() + theme(legend.position = "none", axis.title = element_blank())
+
+    p_dens <- ggplot(df_d, aes(x)) + geom_density(col = "red") + th
+    p_qq   <- ggplot(df_d, aes(sample = x)) + stat_qq() + stat_qq_line() + th
+
+    sub <- file.path("SHASH_Transformations_Dist_Shapes", folder)
+    save_plot(p_dens, paste0("density_dist=", d, ".png"), sub)
+    save_plot(p_qq,   paste0("QQ_dist=", d, ".png"), sub)
+  }
+}
+
+plot_shapes(df_dist_shapes, "Before")
+
+# rrobot takes sigma and tau on the log scale
+df_shash_to_norm <- df_dist_shapes %>%
+  left_join(param_tbl, by = "dist") %>%
+  group_by(dist) %>%
+  mutate(x = rrobot::SHASH_to_normal(x, mu = first(mu), sigma = log(first(sigma)),
+                                     nu = first(nu), tau = log(first(tau)))) %>%
+  ungroup() %>%
+  dplyr::select(dist, x) %>%
+  mutate(dist = factor(dist, levels = param_tbl$dist))
+
+plot_shapes(df_shash_to_norm, "After")
+```
+
+## Figure 2: non-SHASH distributions
+
+Uses the same 100,000 draws and fits as the parameter table above.
+
+```{r}
+dist_display <- c(df_normal = "Normal", df_T = "T", df_laplace = "Laplace",
+                  df_gamma = "Gamma", df_chisq = "Chi-square", df_weibull = "Weibull")
+skewed <- c("Gamma", "Chi-square", "Weibull")
+fig2_dir <- "SHASH_Transformations_Distributions"
+
+for (d in dist_fit) {
+  name   <- dist_display[[d]]
+  fname  <- gsub(" ", "_", name)
+  x      <- df_dist_fit$x[df_dist_fit$dist == d]
+  est    <- param_df %>% filter(dist == d)
+  x_norm <- rrobot::SHASH_to_normal(x, mu = est$mu, sigma = est$sigma, nu = est$nu, tau = est$tau)
+
+  # Before: density on the original scale
+  p <- ggplot(data.frame(x = x), aes(x)) +
+    geom_density(color = "steelblue") +
+    labs(title = NULL, x = NULL, y = NULL) +
+    theme_light() +
+    theme(axis.text = element_text(size = 9), axis.ticks = element_line(linewidth = 0.3))
+  if (name %in% skewed) p <- p + scale_x_continuous(limits = c(-4, max(x)))
+  save_plot(p, paste0("density_", fname, ".png"), file.path(fig2_dir, "Before"))
+
+  # After: transformed density against N(0, 1)
+  p <- ggplot(data.frame(x_norm = x_norm), aes(x_norm)) +
+    geom_density(color = "tomato") +
+    stat_function(fun = dnorm, color = "black", linewidth = 0.5, linetype = "dashed") +
+    labs(title = NULL, x = NULL, y = NULL) +
+    theme_light() +
+    theme(axis.text = element_text(size = 9), axis.ticks = element_line(linewidth = 0.3))
+  save_plot(p, paste0("density_", fname, ".png"), file.path(fig2_dir, "After"))
+
+  # QQ: standardized original vs transformed
+  df_plot <- bind_rows(
+    data.frame(x = as.numeric(scale(x)), type = "Before (Standardized)"),
+    data.frame(x = x_norm,               type = "After SHASH")
+  ) %>%
+    mutate(type = factor(type, levels = c("Before (Standardized)", "After SHASH")))
+
+  p <- ggplot(df_plot, aes(sample = x, color = type)) +
+    stat_qq() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black", linewidth = 0.5) +
+    scale_color_manual(values = c("Before (Standardized)" = "steelblue", "After SHASH" = "tomato")) +
+    labs(title = NULL, x = "Sample Quantiles", y = NULL) +
+    theme_light() +
+    theme(axis.text = element_text(size = 9), axis.ticks = element_line(linewidth = 0.3),
+          legend.position = "none")
+  save_plot(p, paste0("QQ_", fname, ".png"), file.path(fig2_dir, "CombinedQQ"))
+}
+```
+
+Shared legend for Figure 2.
+
+```{r}
+dummy_bars <- data.frame(
+  x = c(1, 2), y = c(1, 1),
+  group = factor(c("Before Transformation", "After Transformation"),
+                 levels = c("Before Transformation", "After Transformation"))
+)
+dummy_line <- data.frame(x = c(0, 1), y = c(0, 1), lty = "N(0, 1)")
+
+p <- ggplot() +
+  geom_col(data = dummy_bars, aes(x = x, y = y, fill = group), color = "black") +
+  geom_line(data = dummy_line, aes(x = x, y = y, linetype = lty), color = "black") +
+  scale_fill_manual(name = NULL,
+                    values = c("Before Transformation" = "steelblue", "After Transformation" = "tomato")) +
+  scale_linetype_manual(name = NULL, values = c("N(0, 1)" = "dashed")) +
+  guides(fill = guide_legend(order = 1, override.aes = list(color = "black")),
+         linetype = guide_legend(order = 2)) +
+  theme_void() +
+  theme(legend.position = "bottom", legend.direction = "horizontal")
+
+legend_only <- ggdraw(ggpubr::get_legend(p))
+legend_only
+save_plot(legend_only, "legend.png", fig2_dir, width = 6, height = 0.6, dpi = 300, bg = "white")
+```
+
+## Figure 3: contamination process
+
+10% contamination at n = 500, generated the same way as in `1.1_SimulationCode.Rmd`.
+Each distribution gets four panels: original, transformed, outliers added on the transformed scale, and back-transformed.
+The paper shows Laplace and Gamma.
+
+```{r}
+set.seed(42)
+
+n_size <- 500
+n_out  <- round(n_size * 0.10)
+
+dist_list <- list(
+  df_normal  = rnorm(n_size, mean = 10, sd = 3),
+  df_T       = rt(n_size, df = 4),
+  df_laplace = vsgoftest::rlaplace(n_size, mu = 0, b = 3),
+  df_gamma   = rgamma(n_size, shape = 2, rate = 1),
+  df_chisq   = rchisq(n_size, df = 3),
+  df_weibull = rweibull(n_size, shape = 1, scale = 3)
+)
+
+to_normal <- function(x, d) {
+  if (d == "df_normal") return((x - 10) / 3)
+  est <- param_df %>% filter(dist == d)
+  rrobot::SHASH_to_normal(x, mu = est$mu, sigma = est$sigma, nu = est$nu, tau = est$tau)
+}
+
+for (d in names(dist_list)) {
+  dat <- dist_list[[d]]
+
+  outlier_idx <- sample(seq_len(n_size), n_out)
+  is_out      <- seq_len(n_size) %in% outlier_idx
+  out_vals    <- rchisq(n_out, df = 4) / 5 + 3
+  if (d %in% c("df_T", "df_laplace", "df_normal")) {
+    out_vals <- sample(c(-1, 1), n_out, replace = TRUE) * out_vals
+  }
+
+  if (d == "df_normal") {
+    z <- (dat - 10) / 3
+    z[outlier_idx] <- out_vals
+    out_dat <- 10 + 3 * z
+  } else {
+    est <- param_df %>% filter(dist == d)
+    out_dat <- dat
+    out_dat[outlier_idx] <- rrobot::normal_to_SHASH(out_vals, mu = est$mu, sigma = est$sigma,
+                                                    nu = est$nu, tau = est$tau)
+  }
+
+  panels <- list(
+    org        = dat,
+    normal_org = to_normal(dat, d),
+    normal_out = to_normal(out_dat, d),
+    out        = out_dat
+  )
+
+  for (v in names(panels)) {
+    df_v <- data.frame(value = panels[[v]], outlier = factor(as.integer(is_out), levels = c(0, 1)))
+    if (v %in% c("org", "normal_org")) df_v$outlier <- factor(0, levels = c(0, 1))
+
+    p <- ggplot(df_v, aes(x = value, fill = outlier)) +
+      geom_histogram(bins = 50) +
+      scale_fill_manual(values = c("0" = "#999999", "1" = "#E69F00")) +
+      theme_few() +
+      theme(legend.position = "none", axis.title = element_blank(),
+            axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+    save_plot(p, paste0("sim_dist=", d, "_", v, ".png"), "ContaminationPlots")
+  }
+}
+```
