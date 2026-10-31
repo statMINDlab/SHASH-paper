@@ -1,0 +1,335 @@
+---
+title: "1.1.2 Simulation fitting"
+author: "Saranjeet Singh Saluja"
+output: html_notebook
+---
+
+Applies the four outlier detection methods to every simulated dataset in `rawdata_simulations.parquet`:
+robust z-scoring, RewML Box-Cox/Yeo-Johnson, SHASH-z and SHASH-i.
+
+Outputs, read by `1.2_Simulation_Analysis.Rmd`:
+
+- `simulation_results_metadata.parquet`: one row per observation, with the flags from each method
+- `simulation_diagnostics.parquet`: one row per fit, with convergence, degeneracy and parameter estimates
+
+The provided output files are the ones used in the paper. Rerunning this file overwrites them.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(tibble)
+library(purrr)
+library(arrow)
+library(cellWise)
+library(rrobot)
+
+data_dir <- "data"
+```
+
+## Settings
+
+The paper uses all 1,000 simulations, all distributions, contamination levels and iForest thresholds.
+For a smaller run, shorten any of the first four settings.
+Fits are saved in batches of `batch_size` simulations, and finished batches are skipped on rerun, so clear `batch_dir` after changing the settings.
+
+```{r}
+n_sims        <- 1000
+distributions <- c("df_normal", "df_T", "df_laplace", "df_gamma", "df_chisq", "df_weibull")
+percentages   <- c("1%", "5%", "10%", "20%", "30%")
+thr_iso_grid  <- c(0.5, 0.55, 0.6)   # iForest+ score thresholds (the paper uses 0.6)
+
+thr1_grid  <- c(2.4, 2.58, 2.8, 3)   # SHASH refit thresholds (the paper uses 3)
+thr0_fixed <- 2.58
+thr_fixed  <- 3
+
+# degenerate fit: more than 1% of points beyond |z| = 20 (rrobot defaults)
+degen_max_abs_z <- 20
+degen_min_frac  <- 0.01
+
+batch_size <- 50
+batch_dir  <- file.path(data_dir, "batches")
+```
+
+## Data
+
+```{r}
+df_results <- read_parquet(file.path(data_dir, "rawdata_simulations.parquet")) %>%
+  mutate(percentage = factor(percentage, levels = c("1%", "5%", "10%", "20%", "30%"))) %>%
+  filter(simulation   <= n_sims,
+         distribution %in% distributions,
+         percentage   %in% percentages,
+         threshold    %in% thr_iso_grid)
+
+cat("rows:", nrow(df_results), "\n")
+```
+
+## Helpers
+
+```{r}
+tail_type <- function(dist_name) {
+  if (dist_name %in% c("df_T", "df_laplace", "df_normal")) "both" else "upper"
+}
+
+thr1_label <- function(t) gsub("\\.", "_", as.character(t))
+
+flag_by_tail <- function(z, thr, tail) {
+  if (tail == "upper")      z > thr
+  else if (tail == "lower") z < -thr
+  else                      abs(z) > thr
+}
+
+# Warnings from one fit are joined as "a | b | c"; most specific label first
+classify_warning <- function(msg) {
+  if (is.na(msg)) return("none")
+  if (grepl("gamlssML estimation failed", msg, fixed = TRUE)) return("fit_failed")
+  if (grepl("singular convergence", msg, ignore.case = TRUE)) return("optim_singular")
+  if (grepl("convergence problem|iteration limit|function evaluation limit",
+            msg, ignore.case = TRUE)) return("convergence")
+  if (grepl("OpenMP|thread", msg, ignore.case = TRUE)) return("openmp_notice")
+  "other"
+}
+```
+
+SHASH fit that records warnings, errors, convergence and degeneracy instead of stopping.
+Estimates are on the link scale (log sigma, log tau), as `SHASH_out` returns them.
+
+```{r}
+fit_shash <- function(x, tail, thr1, method_init, thr_iso = 0.6) {
+  msgs      <- character(0)
+  degen_msg <- NA_character_
+
+  result <- withCallingHandlers(
+    tryCatch({
+      res <- rrobot::SHASH_out(
+        x,
+        thr0        = thr0_fixed,
+        thr1        = thr1,
+        thr         = thr_fixed,
+        tail        = tail,
+        method_init = method_init,
+        thr_iso     = thr_iso,
+        maxit       = 100,
+        max_abs_z   = degen_max_abs_z,
+        min_frac    = degen_min_frac
+      )
+      list(out_idx    = res$out_idx,
+           converged  = isTRUE(res$converged),
+           last_iter  = res$last_iter,
+           degenerate = res$degenerate,
+           max_abs_z  = res$max_abs_z,
+           n_extreme  = res$n_extreme,
+           est        = res$SHASH_coef,
+           error      = NA_character_)
+    }, error = function(e) {
+      list(out_idx = NULL, converged = NA, last_iter = NA_integer_,
+           degenerate = NA, max_abs_z = NA_real_, n_extreme = NA_integer_,
+           est = NULL, error = e$message)
+    }),
+    # the degeneracy warning is stored on its own, not with the other warnings
+    SHASH_degenerate_fit = function(w) {
+      degen_msg <<- conditionMessage(w)
+      invokeRestart("muffleWarning")
+    },
+    warning = function(w) {
+      msgs[[length(msgs) + 1]] <<- conditionMessage(w)
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  all_msgs <- c(result$error, msgs)
+  all_msgs <- all_msgs[!is.na(all_msgs)]
+  getp <- function(p) if (is.null(result$est)) NA_real_ else unname(result$est[[p]])
+
+  list(
+    out_idx        = result$out_idx,
+    converged      = result$converged,
+    last_iter      = result$last_iter,
+    singular       = any(grepl("singular", all_msgs, ignore.case = TRUE)),
+    optim_singular = any(grepl("singular convergence", all_msgs, ignore.case = TRUE)),
+    fit_failed     = !is.na(result$error),
+    degenerate     = result$degenerate,
+    max_abs_z      = result$max_abs_z,
+    n_extreme      = result$n_extreme,
+    degen_msg      = degen_msg,
+    est_mu         = getp("mu"),
+    est_sigma      = getp("sigma"),
+    est_nu         = getp("nu"),
+    est_tau        = getp("tau"),
+    warned         = length(all_msgs) > 0,
+    error          = if (length(all_msgs) > 0) paste(all_msgs, collapse = " | ") else NA_character_
+  )
+}
+```
+
+## Methods
+
+Runs all methods on one dataset. Returns the per-observation flags; the per-fit diagnostics go to `DIAG_STORE`.
+
+```{r}
+run_methods <- function(.x, .y) {
+  x        <- unlist(.x$outlier_infused_values)
+  org      <- unlist(.x$original_values)
+  true_out <- unlist(.x$true_outliers)
+  n        <- length(x)
+
+  dist_name <- as.character(.y$distribution)
+  thr_iso   <- as.numeric(.y$threshold)
+  tail      <- tail_type(dist_name)
+
+  # RewML Box-Cox / Yeo-Johnson
+  rryj_msg <- NA_character_
+  flagged_rryj <- tryCatch({
+    yj <- as.vector(cellWise::transfo(x, type = "bestObj", robust = TRUE, standardize = TRUE)$Y)
+    flag_by_tail(yj, 3, tail)
+  }, error = function(e) {
+    rryj_msg <<- e$message
+    rep(NA, n)
+  })
+
+  # Robust z-scoring (median and MAD)
+  emp_msg <- NA_character_
+  flagged_emprule <- tryCatch({
+    rrobot:::emprule_rob(x, thr = 3, tail = tail)
+  }, error = function(e) {
+    emp_msg <<- e$message
+    rep(NA, n)
+  })
+
+  # SHASH-z and SHASH-i for each thr1
+  flag_cols <- list()
+  diag_rows <- list()
+
+  for (t1 in thr1_grid) {
+    lab <- thr1_label(t1)
+    z <- fit_shash(x, tail, t1, method_init = "emprule")
+    i <- fit_shash(x, tail, t1, method_init = "isoplus", thr_iso = thr_iso)
+
+    flag_cols[[paste0("flagged_z_thr", lab)]] <-
+      if (!is.null(z$out_idx)) seq_len(n) %in% z$out_idx else rep(NA, n)
+    flag_cols[[paste0("flagged_i_thr", lab)]] <-
+      if (!is.null(i$out_idx)) seq_len(n) %in% i$out_idx else rep(NA, n)
+
+    diag_rows[[length(diag_rows) + 1]] <- tibble(
+      method         = c("SHASH-z", "SHASH-i"),
+      thr1           = t1,
+      singular_error = c(z$singular,       i$singular),
+      optim_singular = c(z$optim_singular, i$optim_singular),
+      fit_failed     = c(z$fit_failed,     i$fit_failed),
+      degenerate     = c(z$degenerate,     i$degenerate),
+      max_abs_z      = c(z$max_abs_z,      i$max_abs_z),
+      n_extreme      = c(z$n_extreme,      i$n_extreme),
+      degen_msg      = c(z$degen_msg,      i$degen_msg),
+      est_mu         = c(z$est_mu,         i$est_mu),
+      est_sigma      = c(z$est_sigma,      i$est_sigma),
+      est_nu         = c(z$est_nu,         i$est_nu),
+      est_tau        = c(z$est_tau,        i$est_tau),
+      warned         = c(z$warned,         i$warned),
+      error_msg      = c(z$error,          i$error),
+      iter_converged = c(z$converged,      i$converged),
+      last_iter      = c(z$last_iter,      i$last_iter)
+    )
+  }
+
+  diagnostics <- bind_rows(diag_rows) %>%
+    bind_rows(tibble(
+      method         = c("RewML Box-Cox/YJ", "Robust Z-Scoring"),
+      thr1           = NA_real_,
+      singular_error = NA,
+      warned         = c(!is.na(rryj_msg), !is.na(emp_msg)),
+      error_msg      = c(rryj_msg, emp_msg),
+      iter_converged = NA,
+      last_iter      = NA_integer_
+    ))
+
+  key <- paste(.y$simulation, .y$distribution, .y$threshold, .y$percentage, sep = "|")
+  DIAG_STORE[[key]] <<- diagnostics %>%
+    mutate(simulation   = .y$simulation,
+           distribution = .y$distribution,
+           threshold    = .y$threshold,
+           percentage   = .y$percentage)
+
+  tibble(
+    obs_index              = seq_len(n),
+    original_values        = org,
+    outlier_infused_values = x,
+    true_outliers          = true_out,
+    flagged_rryj           = flagged_rryj,
+    flagged_emprule        = flagged_emprule
+  ) %>%
+    bind_cols(as_tibble(flag_cols))
+}
+```
+
+## Run in batches
+
+```{r}
+dir.create(batch_dir, recursive = TRUE, showWarnings = FALSE)
+
+batches <- seq(1, n_sims, by = batch_size)
+
+for (b in batches) {
+  flag_file <- file.path(batch_dir, paste0("flags_", b, ".parquet"))
+  diag_file <- file.path(batch_dir, paste0("diag_",  b, ".parquet"))
+
+  if (file.exists(flag_file) && file.exists(diag_file)) {
+    cat("Skipping batch", b, "(already done)\n")
+    next
+  }
+
+  batch_sims <- b:min(b + batch_size - 1, n_sims)
+  cat("Running simulations", b, "to", max(batch_sims), "\n")
+
+  DIAG_STORE <- new.env(parent = emptyenv())
+
+  batch_flags <- df_results %>%
+    filter(simulation %in% batch_sims) %>%
+    group_by(simulation, distribution, threshold, percentage) %>%
+    group_modify(run_methods) %>%
+    ungroup()
+
+  write_parquet(batch_flags, flag_file)
+  write_parquet(bind_rows(as.list(DIAG_STORE)), diag_file)
+
+  rm(batch_flags, DIAG_STORE)
+  gc()
+}
+```
+
+## Combine and save
+
+```{r}
+df_flagged <- map_dfr(batches, function(b) {
+  read_parquet(file.path(batch_dir, paste0("flags_", b, ".parquet")))
+})
+
+df_diag <- map_dfr(batches, function(b) {
+  read_parquet(file.path(batch_dir, paste0("diag_", b, ".parquet")))
+}) %>%
+  mutate(warning_class = sapply(error_msg, classify_warning))
+
+write_parquet(df_flagged, file.path(data_dir, "simulation_results_metadata.parquet"))
+write_parquet(df_diag,    file.path(data_dir, "simulation_diagnostics.parquet"))
+
+cat("flag rows:", nrow(df_flagged), " diagnostic rows:", nrow(df_diag), "\n")
+```
+
+## Fit summary
+
+```{r}
+df_diag %>%
+  filter(method %in% c("SHASH-z", "SHASH-i")) %>%
+  group_by(distribution, percentage, method, threshold, thr1) %>%
+  summarise(
+    n_fits         = n(),
+    pct_warned     = round(100 * mean(warned, na.rm = TRUE), 1),
+    pct_degenerate = round(100 * mean(degenerate, na.rm = TRUE), 1),
+    pct_converged  = round(100 * mean(iter_converged, na.rm = TRUE), 1),
+    max_last_iter  = max(last_iter, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_degenerate)) %>%
+  print(n = 50)
+```
