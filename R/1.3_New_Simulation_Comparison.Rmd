@@ -27,8 +27,8 @@ library(arrow)
 library(ggplot2)
 library(rrobot)
 
-plot_dir <- "plots"
-data_dir <- "data"
+plot_dir <- "../plots"
+data_dir <- "../data"
 ```
 
 ## Settings
@@ -179,26 +179,28 @@ run_methods_new <- function(.x, .y) {
 }
 ```
 
-```{r, eval = run_fits}
-df_sim <- read_parquet(file.path(data_dir, "rawdata_simulations.parquet")) %>%
-  mutate(percentage = factor(percentage, levels = pct_levels)) %>%
-  filter(threshold == thr_iso,
-         simulation   <= n_sims,
-         distribution %in% distributions,
-         percentage   %in% percentages)
+```{r}
+if (run_fits) {
+  df_sim <- read_parquet(file.path(data_dir, "rawdata_simulations.parquet")) %>%
+    mutate(percentage = factor(percentage, levels = pct_levels)) %>%
+    filter(threshold == thr_iso,
+           simulation   <= n_sims,
+           distribution %in% distributions,
+           percentage   %in% percentages)
 
-DIAG_STORE <- new.env(parent = emptyenv())
+  DIAG_STORE <- new.env(parent = emptyenv())
 
-df_new <- df_sim %>%
-  group_by(simulation, distribution, threshold, percentage) %>%
-  group_modify(run_methods_new) %>%
-  ungroup()
+  df_new <- df_sim %>%
+    group_by(simulation, distribution, threshold, percentage) %>%
+    group_modify(run_methods_new) %>%
+    ungroup()
 
-df_diag <- bind_rows(as.list(DIAG_STORE)) %>%
-  mutate(warning_class = sapply(error_msg, classify_warning))
+  df_diag <- bind_rows(as.list(DIAG_STORE)) %>%
+    mutate(warning_class = sapply(error_msg, classify_warning))
 
-write_parquet(df_new,  results_file)
-write_parquet(df_diag, diag_file)
+  write_parquet(df_new,  results_file)
+  write_parquet(df_diag, diag_file)
+}
 ```
 
 ## Results
@@ -270,7 +272,7 @@ df_metrics <- df_new %>%
   left_join(df_diag %>% dplyr::select(simulation, distribution, threshold, percentage,
                                       method, degenerate),
             by = c("simulation", "distribution", "threshold", "percentage", "method")) %>%
-  mutate(distribution = factor(recode(distribution, !!!dist_recode), levels = dist_levels))
+  mutate(distribution = recode(distribution, !!!dist_recode))
 
 summarise_perf <- function(d) {
   d %>%
@@ -281,8 +283,13 @@ summarise_perf <- function(d) {
               .groups  = "drop")
 }
 
-perf_summary         <- summarise_perf(df_metrics)
-perf_summary_nodegen <- summarise_perf(df_metrics %>% filter(!(degenerate %in% TRUE)))
+# where the factor is set decides which overlapping points are drawn on top
+perf_summary <- summarise_perf(df_metrics) %>%
+  mutate(distribution = factor(distribution, levels = dist_levels))
+perf_summary_nodegen <- df_metrics %>%
+  filter(!(degenerate %in% TRUE)) %>%
+  mutate(distribution = factor(distribution, levels = dist_levels)) %>%
+  summarise_perf()
 
 # cells left with fewer fits after removal
 # (response: SHASH-50 keeps 25 Weibull and 192 Chi-square datasets of 1,000 at 20%)
@@ -310,8 +317,9 @@ dw <- function(d) {
 
 degen_cmp <- df_metrics %>%
   filter(method != "iForest+") %>%
-  mutate(degen  = degenerate %in% TRUE,
-         method = factor(method, levels = c("SHASH-i", "SHASH-z", "SHASH-50")))
+  mutate(degen        = degenerate %in% TRUE,
+         method       = factor(method, levels = c("SHASH-i", "SHASH-z", "SHASH-50")),
+         distribution = factor(distribution, levels = dist_levels))
 
 degen_cmp %>% group_by(method) %>% dw() %>% print(width = Inf)
 
