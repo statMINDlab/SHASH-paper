@@ -5,7 +5,7 @@ output: html_notebook
 ---
 
 Generates the contaminated datasets for simulation study 2 (manuscript Figures 6, 7 and S.4–S.9).
-Output: `simulation_data.parquet`, which is read by `1.1.2_Simulation_Fitting.Rmd`.
+Output: `rawdata_simulations.parquet`, which is read by `1.1.2_Simulation_Fitting.Rmd`.
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(warning = FALSE, message = FALSE)
@@ -14,16 +14,17 @@ knitr::opts_chunk$set(warning = FALSE, message = FALSE)
 ```{r}
 library(dplyr)
 library(purrr)
+library(tidyr)
 library(vsgoftest)
 library(gamlss)
 library(arrow)
-library(rrobot)   
+library(rrobot)
 ```
 
 ## Settings
 
 The paper uses `nsim = 1000` with all distributions and contamination levels.
-This file shows how the data were generated; rerunning it will not reproduce the exact `simulation_data.parquet` used in the paper, which is provided and read by the later files.
+This file shows how the data were generated; rerunning it will not reproduce the exact `rawdata_simulations.parquet` used in the paper, which is provided and read by the later files.
 For a smaller run, lower `nsim` or shorten `distributions` / `percentages`.
 
 ```{r}
@@ -136,7 +137,9 @@ set.seed(42)
 
 df_results <- map_dfr(seq_len(nsim), generate_sim) %>%
   filter(distribution %in% distributions, percentage %in% percentages) %>%
-  mutate(percentage = factor(percentage, levels = c("1%", "5%", "10%", "20%", "30%")))
+  mutate(percentage = factor(percentage, levels = c("1%", "5%", "10%", "20%", "30%"))) %>%
+  unnest(c(original_values, outlier_infused_values, true_outliers)) %>%   # one row per observation
+  relocate(percentage, .before = threshold)
 
 write_parquet(df_results, file.path(data_dir, "rawdata_simulations.parquet"))
 df_results

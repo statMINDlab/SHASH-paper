@@ -1,0 +1,282 @@
+---
+title: "03 Robust estimators under contamination"
+author: "Saranjeet Singh Saluja"
+output: html_notebook
+---
+
+How outliers bias robust estimators of center and scale, using the simulation study 2 data (contamination 0–20%).
+
+- Figure S.11: sampling distributions of the median and MAD, Normal and Gamma
+- Figure S.12: mean of each center and scale estimator by contamination level
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(arrow)
+library(robustbase)
+library(cowplot)
+
+plot_dir <- "plots"
+data_dir <- "data"
+
+out_dir <- file.path(plot_dir, "thr3", "Miscellaneous")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Settings
+
+The paper uses all 1,000 simulations. The estimates are saved to `est_file` and reused on later runs, so delete that file after changing `n_sims`.
+
+```{r}
+n_sims   <- 1000
+pct_all  <- c("0%", "1%", "5%", "10%", "20%")
+est_file <- file.path(data_dir, "robust_estimators_by_sim.parquet")
+```
+
+## Data
+
+The raw file repeats each dataset for every iForest threshold; one copy is kept, since the estimators don't depend on it.
+
+```{r}
+df_results <- read_parquet(file.path(data_dir, "rawdata_simulations.parquet")) %>%
+  filter(threshold == 0.6, simulation <= n_sims) %>%
+  mutate(percentage = as.character(percentage))
+```
+
+## True values
+
+True median and scaled MAD (1.4826 × MAD, equal to σ for a normal) of each uncontaminated distribution.
+The MAD d solves F(m + d) − F(m − d) = 0.5, where m is the median.
+
+```{r}
+plaplace <- function(q, m = 0, b = 3) ifelse(q < m, 0.5 * exp((q - m) / b), 1 - 0.5 * exp(-(q - m) / b))
+
+dist_info <- tribble(
+  ~distribution, ~label,       ~true_median,
+  "df_normal",   "Normal",     10,
+  "df_T",        "T",          0,
+  "df_laplace",  "Laplace",    0,
+  "df_gamma",    "Gamma",      qgamma(0.5, 2, scale = 1),
+  "df_chisq",    "Chi-square", qchisq(0.5, df = 3),
+  "df_weibull",  "Weibull",    qweibull(0.5, shape = 1, scale = 3)
+)
+
+cdf_list <- list(
+  df_normal  = function(q) pnorm(q, 10, 3),
+  df_T       = function(q) pt(q, df = 4),
+  df_laplace = function(q) plaplace(q),
+  df_gamma   = function(q) pgamma(q, 2, scale = 1),
+  df_chisq   = function(q) pchisq(q, df = 3),
+  df_weibull = function(q) pweibull(q, shape = 1, scale = 3)
+)
+
+pop_scaled_mad <- function(cdf, m) {
+  d <- uniroot(function(d) cdf(m + d) - cdf(m - d) - 0.5, c(1e-8, 100), tol = 1e-10)$root
+  1.4826 * d
+}
+
+pop_ref <- dist_info %>%
+  mutate(true_mad = map2_dbl(distribution, true_median, ~ pop_scaled_mad(cdf_list[[.x]], .y)))
+
+dist_levels <- pop_ref$label
+pop_ref
+```
+
+## Estimates
+
+Median and Huber center; MAD, Sn, Qn and Huber scale (`MASS::hubers`, k = 1.5).
+MAD, Sn and Qn use their normal-consistency constants. "0%" is each dataset's values before contamination.
+
+```{r}
+estimate_all <- function(x) {
+  hub <- tryCatch(MASS::hubers(x), error = function(e) list(mu = NA_real_, s = NA_real_))
+  tibble(Median      = median(x),
+         HuberCenter = hub$mu,
+         MAD         = mad(x),
+         HuberScale  = hub$s,
+         Sn          = Sn(x),
+         Qn          = Qn(x))
+}
+
+if (file.exists(est_file)) {
+  est_wide <- read_parquet(est_file)
+} else {
+  est_cont <- df_results %>%
+    filter(percentage %in% pct_all) %>%
+    group_by(distribution, percentage, simulation) %>%
+    reframe(estimate_all(outlier_infused_values))
+
+  # the original values are the same at every contamination level; take them from 1%
+  est_orig <- df_results %>%
+    filter(percentage == "1%") %>%
+    group_by(distribution, simulation) %>%
+    reframe(estimate_all(original_values)) %>%
+    mutate(percentage = "0%")
+
+  est_wide <- bind_rows(est_orig, est_cont)
+  write_parquet(est_wide, est_file)
+}
+
+est_all <- est_wide %>%
+  filter(percentage %in% pct_all) %>%
+  pivot_longer(c(Median, HuberCenter, MAD, HuberScale, Sn, Qn),
+               names_to = "metric", values_to = "value") %>%
+  left_join(pop_ref %>% dplyr::select(distribution, label), by = "distribution") %>%
+  mutate(label      = factor(label, levels = dist_levels),
+         percentage = factor(percentage, levels = pct_all),
+         metric     = factor(metric, levels = c("Median", "HuberCenter", "MAD", "HuberScale", "Sn", "Qn")),
+         group_type = if_else(metric %in% c("Median", "HuberCenter"), "Center", "Scale"))
+```
+
+## Figure S.12: mean estimates by contamination level
+
+One panel per distribution; the dashed line is the true median (center) or true scaled MAD (scale).
+
+```{r}
+metric_colors <- c("Median" = "black",   "HuberCenter" = "#E31A1C",
+                   "MAD"    = "black",   "HuberScale"  = "#E31A1C",
+                   "Sn"     = "#377EB8", "Qn"          = "#E69F00")
+
+line_theme <- theme_bw(base_size = 11) +
+  theme(legend.position    = "none",
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor   = element_blank(),
+        panel.grid.major.y = element_line(linewidth = 0.25, color = "grey85"),
+        strip.background   = element_rect(fill = "white", color = "black", linewidth = 0.4),
+        strip.text.y.right = element_text(angle = 270),
+        strip.placement    = "outside",
+        axis.title         = element_text(size = 11),
+        axis.text          = element_text(size = 9),
+        panel.border       = element_rect(color = "black", linewidth = 0.4),
+        panel.spacing      = unit(0.8, "lines"))
+
+plot_lines <- function(group, ref_col, ref_label) {
+  sum_df <- est_all %>%
+    filter(group_type == group) %>%
+    group_by(label, percentage, metric) %>%
+    summarise(mean = mean(value, na.rm = TRUE), .groups = "drop")
+
+  ref_df <- pop_ref %>%
+    mutate(label = factor(label, levels = dist_levels), true_value = .data[[ref_col]])
+
+  ggplot(sum_df, aes(x = percentage, y = mean, color = metric, group = metric)) +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 1.8, shape = 21, stroke = 0.35, color = "black") +
+    geom_hline(data = ref_df, aes(yintercept = true_value, linetype = ref_label),
+               color = "black", linewidth = 0.5, inherit.aes = FALSE) +
+    facet_wrap(~ label, ncol = 1, scales = "free_y", strip.position = "right") +
+    scale_color_manual(values = metric_colors) +
+    scale_linetype_manual(values = setNames("dashed", ref_label)) +
+    labs(y = "Mean of estimates", x = "Outlier percentage", color = "Estimator", linetype = NULL) +
+    line_theme
+}
+```
+
+```{r, fig.height = 12, fig.width = 8}
+p_center <- plot_lines("Center", "true_median", "True median")
+p_scale  <- plot_lines("Scale",  "true_mad",    "True scaled MAD")
+
+ggsave(file.path(out_dir, "CenterEstimators-LineGraph_sans_30.png"), p_center, width = 5, height = 8)
+ggsave(file.path(out_dir, "ScaleEstimators-LineGraph_sans_30.png"),  p_scale,  width = 5, height = 8)
+
+p_center
+p_scale
+```
+
+Legends, saved separately and placed under each panel.
+
+```{r}
+leg_theme <- theme(legend.position = "bottom", legend.direction = "horizontal",
+                   legend.box = "horizontal", legend.text = element_text(size = 9))
+
+ggsave(file.path(out_dir, "Legend-Center-LineGraph.png"), ggdraw(get_legend(p_center + leg_theme)),
+       width = 5, height = 0.5, dpi = 300, bg = "white")
+ggsave(file.path(out_dir, "Legend-Scale-LineGraph.png"), ggdraw(get_legend(p_scale + leg_theme)),
+       width = 5, height = 0.5, dpi = 300, bg = "white")
+```
+
+## Figure S.11: sampling distributions of the median and MAD
+
+One row per contamination level. The dark red line is the mean of the estimates and the black dashed line the true value.
+The x-limits are fixed per distribution.
+
+```{r}
+hist_limits <- list(
+  df_normal = list(Median = c(9.2, 10.6), MAD = c(2.5, 5.6)),
+  df_gamma  = list(Median = c(1.3, 3.0),  MAD = c(0.8, 3.0))
+)
+
+plot_hist <- function(dist_key) {
+  lims <- hist_limits[[dist_key]]
+  d <- est_all %>%
+    filter(distribution == dist_key, metric %in% c("Median", "MAD")) %>%
+    mutate(metric = factor(as.character(metric), levels = c("Median", "MAD")))
+
+  avg_df <- d %>%
+    group_by(percentage, metric) %>%
+    summarise(avg_value = mean(value, na.rm = TRUE), .groups = "drop")
+
+  true_df <- d %>%
+    distinct(percentage, metric) %>%
+    mutate(true_value = if_else(metric == "Median",
+                                pop_ref$true_median[pop_ref$distribution == dist_key],
+                                pop_ref$true_mad[pop_ref$distribution == dist_key]))
+
+  # invisible points that fix each column's x-range
+  limits_df <- distinct(d, percentage) %>%
+    crossing(tibble(metric = factor(c("Median", "Median", "MAD", "MAD"), levels = c("Median", "MAD")),
+                    value  = c(lims$Median, lims$MAD)))
+
+  ggplot(d, aes(x = value)) +
+    geom_histogram(data = filter(d, metric == "Median"), aes(y = after_stat(density)),
+                   binwidth = 0.05, boundary = lims$Median[1], closed = "left",
+                   fill = "grey80", colour = "black", linewidth = 0.25) +
+    geom_histogram(data = filter(d, metric == "MAD"), aes(y = after_stat(density)),
+                   binwidth = 0.05, boundary = lims$MAD[1], closed = "left",
+                   fill = "grey60", colour = "black", linewidth = 0.25) +
+    geom_vline(data = avg_df,  aes(xintercept = avg_value),
+               colour = "darkred", linewidth = 0.6, linetype = "solid") +
+    geom_vline(data = true_df, aes(xintercept = true_value),
+               colour = "black", linewidth = 0.4, linetype = "dashed") +
+    geom_blank(data = limits_df, aes(x = value, y = 0)) +
+    facet_grid(percentage ~ metric, scales = "free_x") +
+    scale_x_continuous(expand = expansion(mult = 0)) +
+    labs(x = NULL, y = "Density") +
+    theme_bw(base_size = 10) +
+    theme(panel.grid       = element_blank(),
+          strip.background = element_rect(fill = "white", colour = "black", linewidth = 0.25),
+          strip.text       = element_text(face = "bold", size = 9),
+          axis.title       = element_text(size = 10),
+          axis.text        = element_text(size = 8),
+          panel.border     = element_rect(colour = "black", linewidth = 0.25),
+          panel.spacing    = unit(0.7, "lines"),
+          legend.position  = "none")
+}
+
+for (dk in names(hist_limits)) {
+  ggsave(file.path(out_dir, paste0("Median_MAD_Histogram_", dk, "_sans_30.png")),
+         plot_hist(dk), width = 6, height = 4 * length(pct_all) / 6)
+}
+```
+
+## Bias relative to the true value
+
+Mean estimate minus the true value, as a percentage of the true value, by distribution and contamination level.
+For T and Laplace the true median is 0, so the center row is the raw difference × 100.
+
+```{r}
+est_all %>%
+  left_join(pop_ref %>% dplyr::select(distribution, true_median, true_mad), by = "distribution") %>%
+  mutate(true_value = if_else(group_type == "Center", true_median, true_mad)) %>%
+  group_by(label, metric, percentage) %>%
+  summarise(mean_est = mean(value, na.rm = TRUE), true = first(true_value), .groups = "drop") %>%
+  mutate(rel_bias_pct = round(100 * (mean_est - true) / abs(if_else(true == 0, 1, true)), 1)) %>%
+  dplyr::select(label, metric, percentage, rel_bias_pct) %>%
+  pivot_wider(names_from = percentage, values_from = rel_bias_pct)
+```
